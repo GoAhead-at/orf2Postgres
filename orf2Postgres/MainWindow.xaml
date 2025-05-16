@@ -1,0 +1,159 @@
+<Window x:Class="orf2Postgres.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:orf2Postgres"
+        mc:Ignorable="d"
+        Title="ORF Log to Postgres Control Panel" Height="600" Width="800">
+    <Window.Resources>
+        <!-- Define a common style for the database operation buttons -->
+        <Style x:Key="DatabaseButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="150" />
+            <Setter Property="Margin" Value="5,3" />
+            <Setter Property="Padding" Value="5,2" />
+            <Setter Property="HorizontalAlignment" Value="Right" />
+        </Style>
+    </Window.Resources>
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <!-- Configuration -->
+            <RowDefinition Height="Auto"/>
+            <!-- Controls & Status -->
+            <RowDefinition Height="*"/>
+            <!-- Logs -->
+            <RowDefinition Height="Auto"/>
+            <!-- Current Activity -->
+        </Grid.RowDefinitions>
+
+        <!-- Configuration Section -->
+        <GroupBox Header="Configuration" Grid.Row="0" Margin="0,0,0,10" Padding="5">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <Label Content="Log Directory:" Grid.Row="0" Grid.Column="0" VerticalAlignment="Center"/>
+                <DockPanel Grid.Row="0" Grid.Column="1" Margin="5" LastChildFill="True">
+                    <Button x:Name="BrowseLogDirectoryButton" Content="..." DockPanel.Dock="Right" Margin="5,0,0,0" Padding="5,0" VerticalAlignment="Center" Click="BrowseLogDirectoryButton_Click"/>
+                    <TextBox x:Name="LogDirectoryTextBox" VerticalAlignment="Center" />
+                </DockPanel>
+                <Label Content="Log Pattern:" Grid.Row="1" Grid.Column="0" VerticalAlignment="Center"/>
+                <TextBox x:Name="LogFilePatternTextBox" Grid.Row="1" Grid.Column="1" Margin="5" VerticalAlignment="Center" Text="orfee-{Date:yyyy-MM-dd}.log"/>
+                <Label Content="Polling (sec):" Grid.Row="2" Grid.Column="0" VerticalAlignment="Center"/>
+                <TextBox x:Name="PollingIntervalTextBox" Grid.Row="2" Grid.Column="1" Margin="5" VerticalAlignment="Center" Text="5"/>
+                <Label Content="Offset File Path:" Grid.Row="3" Grid.Column="0" VerticalAlignment="Center"/>
+                <TextBox x:Name="OffsetFilePathTextBox" Grid.Row="3" Grid.Column="1" Margin="5" VerticalAlignment="Center" Text="./offsets.json"/>
+
+                <Label Content="DB Host:" Grid.Row="0" Grid.Column="2" VerticalAlignment="Center"/>
+                <TextBox x:Name="DbHostTextBox" Grid.Row="0" Grid.Column="3" Margin="5" VerticalAlignment="Center" Text="localhost"/>
+                <Label Content="DB Port:" Grid.Row="1" Grid.Column="2" VerticalAlignment="Center"/>
+                <TextBox x:Name="DbPortTextBox" Grid.Row="1" Grid.Column="3" Margin="5" VerticalAlignment="Center" Text="5432"/>
+                <Label Content="DB User:" Grid.Row="2" Grid.Column="2" VerticalAlignment="Center"/>
+                <TextBox x:Name="DbUserTextBox" Grid.Row="2" Grid.Column="3" Margin="5" VerticalAlignment="Center"/>
+                <Label Content="DB Password:" Grid.Row="3" Grid.Column="2" VerticalAlignment="Center"/>
+                <PasswordBox x:Name="DbPasswordBox" Grid.Row="3" Grid.Column="3" Margin="5" VerticalAlignment="Center"/>
+                <Label Content="DB Name:" Grid.Row="4" Grid.Column="0" VerticalAlignment="Center"/>
+                <TextBox x:Name="DbNameTextBox" Grid.Row="4" Grid.Column="1" Margin="5" VerticalAlignment="Center"/>
+                <Label Content="DB Schema:" Grid.Row="5" Grid.Column="0" VerticalAlignment="Center"/>
+                <TextBox x:Name="DbSchemaTextBox" Grid.Row="5" Grid.Column="1" Margin="5" VerticalAlignment="Center" Text="public"/>
+                <Label Content="DB Table:" Grid.Row="6" Grid.Column="0" VerticalAlignment="Center"/>
+                <TextBox x:Name="DbTableTextBox" Grid.Row="6" Grid.Column="1" Margin="5" VerticalAlignment="Center" Text="orf_logs"/>
+
+                <!-- Database operation buttons with consistent width -->
+                <Button x:Name="TestConnectionButton" 
+                        Content="Test Connection" 
+                        Style="{StaticResource DatabaseButtonStyle}"
+                        Grid.Column="3" Grid.Row="4" 
+                        HorizontalAlignment="Left"
+                        Click="TestConnectionButton_Click"/>
+                
+                <Button x:Name="ReconnectDatabaseButton" 
+                        Content="Reconnect Database" 
+                        Style="{StaticResource DatabaseButtonStyle}"
+                        Grid.Column="3" Grid.Row="5"
+                        HorizontalAlignment="Left" 
+                        Click="ReconnectDatabaseButton_Click"/>
+                
+                <Button x:Name="EnsureTableButton" 
+                        Content="Create/Verify Table" 
+                        Style="{StaticResource DatabaseButtonStyle}"
+                        Grid.Column="3" Grid.Row="6"
+                        HorizontalAlignment="Left" 
+                        Click="EnsureTableButton_Click"/>
+                
+                <Button x:Name="SaveConfigButton" 
+                        Content="Save Configuration" 
+                        Style="{StaticResource DatabaseButtonStyle}"
+                        Grid.Column="3" Grid.Row="7"
+                        HorizontalAlignment="Left"
+                        Click="SaveConfigButton_Click"/>
+            </Grid>
+        </GroupBox>
+
+        <!-- Controls & Status Section -->
+        <Grid Grid.Row="1" Margin="0,0,0,10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Orientation="Horizontal" Grid.Column="0">
+                <Button x:Name="StartServiceButton" Content="Start Service" Click="StartServiceButton_Click" Margin="5" Padding="10,5" IsEnabled="False"/>
+                <Button x:Name="StopServiceButton" Content="Stop Service" Click="StopServiceButton_Click" Margin="5" Padding="10,5" IsEnabled="False"/>
+                <Button x:Name="ProcessPastFilesButton" Content="Process Past Files" Click="ProcessPastFilesButton_Click" Margin="5" Padding="10,5"/>
+                <Button x:Name="InstallServiceButton" Content="Install Service" Click="InstallServiceButton_Click" Margin="5" Padding="10,5"/>
+                <Button x:Name="UninstallServiceButton" Content="Uninstall Service" Click="UninstallServiceButton_Click" Margin="5" Padding="10,5"/>
+            </StackPanel>
+
+            <StatusBar Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Stretch">
+                <StatusBarItem>
+                    <TextBlock Name="StatusTextBlock" Text="Status: Stopped"/>
+                </StatusBarItem>
+            </StatusBar>
+        </Grid>
+
+        <!-- Log Viewer Section -->
+        <GroupBox Header="Service Logs" Grid.Row="2" Margin="0,0,0,10">
+            <TextBox x:Name="ServiceLogTextBox" IsReadOnly="True" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" FontFamily="Consolas" AcceptsReturn="True"/>
+        </GroupBox>
+
+        <!-- Current Activity Section -->
+        <StatusBar Grid.Row="3">
+            <StatusBarItem>
+                <TextBlock Text="Monitoring File:"/>
+            </StatusBarItem>
+            <StatusBarItem>
+                <TextBlock Name="CurrentFileTextBlock" Text="(none)"/>
+            </StatusBarItem>
+            <Separator/>
+            <StatusBarItem>
+                <TextBlock Text="Offset:"/>
+            </StatusBarItem>
+            <StatusBarItem>
+                <TextBlock Name="CurrentOffsetTextBlock" Text="N/A"/>
+            </StatusBarItem>
+            <Separator/>
+            <StatusBarItem>
+                <TextBlock Text="Batch Size:"/>
+            </StatusBarItem>
+            <StatusBarItem>
+                <TextBlock Name="BatchSizeTextBlock" Text="100"/>
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window> 

@@ -1,0 +1,13 @@
+{
+  "logDirectory": "E:\\SHARED\\_STAEUBER\\DEV\\Projects\\Cursor\\log2Postgres\\logs",
+  "logFilePattern": "orfee-{Date:yyyy-MM-dd}.log",
+  "pollingIntervalSeconds": "5",
+  "offsetFilePath": "E:\\SHARED\\_STAEUBER\\DEV\\Projects\\Cursor\\log2Postgres\\offsets.json",
+  "host": "debian.flipforge.at",
+  "port": "5432",
+  "username": "orf",
+  "password": "orforf",
+  "database": "orf",
+  "schema": "orf",
+  "table": "orf_logs"
+}

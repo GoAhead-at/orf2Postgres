@@ -1,0 +1,13 @@
+{
+  "logDirectory": "C:\\Logs",
+  "logFilePattern": "orfee-{Date:yyyy-MM-dd}.log",
+  "pollingIntervalSeconds": "5",
+  "offsetFilePath": "./offsets.json",
+  "host": "debian.flipforge.at",
+  "port": "5432",
+  "username": "orf",
+  "password": "AQAAANCMnd8BFdERjHoAwE/Cl\u002BsBAAAA/S/yUt4wGUa5Z2/YD8S2PgAAAAACAAAAAAAQZgAAAAEAACAAAAA5Td8SbYQqHk0soCNe47kLeRGJWB4Qi6ekG8jwQANbOwAAAAAOgAAAAAIAACAAAABchaRyTPgOeAAzpajQg7gNsw\u002Bg/mBUxOI6fDTT1D\u002BjzBAAAABf/TK6L2W6p9wuA5pTBArUQAAAAMHXMZpBvmGSgPMnfKaVR17uh6a9bSMY6bK9XHKhPpT6mFOgZBIyIzjEePGETl4CO3y6oLjqLhKdOt2j\u002Bh3yXWQ=",
+  "database": "orf",
+  "schema": "orf",
+  "table": "orf_logs"
+}
