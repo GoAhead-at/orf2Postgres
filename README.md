@@ -38,17 +38,28 @@ CREATE SCHEMA IF NOT EXISTS orf;
 
 CREATE TABLE IF NOT EXISTS orf.orf_logs (
     id SERIAL PRIMARY KEY,
-    timestamp TIMESTAMP WITH TIME ZONE,
-    log_level VARCHAR(50),
-    source VARCHAR(255),
-    message TEXT,
-    file_name VARCHAR(255),
-    file_offset BIGINT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    message_id TEXT,
+    event_source TEXT,
+    event_datetime TIMESTAMPTZ,
+    event_class TEXT,
+    event_severity TEXT,
+    event_action TEXT,
+    filtering_point TEXT,
+    ip TEXT,
+    sender TEXT,
+    recipients TEXT,
+    msg_subject TEXT,
+    msg_author TEXT,
+    remote_peer TEXT,
+    source_ip TEXT,
+    country TEXT,
+    event_msg TEXT,
+    filename TEXT,
+    processed_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_orf_logs_timestamp ON orf.orf_logs(timestamp);
-CREATE INDEX IF NOT EXISTS idx_orf_logs_file_name ON orf.orf_logs(file_name);
+CREATE INDEX IF NOT EXISTS idx_orf_logs_event_datetime ON orf.orf_logs(event_datetime);
+CREATE INDEX IF NOT EXISTS idx_orf_logs_filename ON orf.orf_logs(filename);
 ```
 
 ## Installation
