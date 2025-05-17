@@ -1,3 +1,17 @@
+# .NET build artifacts
+bin/
+obj/
+**/bin/
+**/obj/
+
+# User-specific files
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+.vscode/
+
 # Build results
 [Dd]ebug/
 [Dd]ebugPublic/
@@ -5,21 +19,14 @@
 [Rr]eleases/
 x64/
 x86/
-[Ww][Ii][Nn]32/
-[Aa][Rr][Mm]/
-[Aa][Rr][Mm]64/
 bld/
 [Bb]in/
 [Oo]bj/
 [Ll]og/
-[Ll]ogs/
 
-# Visual Studio files
-.vs/
-*.user
-*.userosscache
-*.sln.docstates
-*.userprefs
+# MSTest test Results
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
 
 # .NET Core
 project.lock.json
@@ -48,7 +55,6 @@ artifacts/
 *.tmp_proj
 *_wpftmp.csproj
 *.log
-*.tlog
 *.vspscc
 *.vssscc
 .builds
@@ -56,27 +62,18 @@ artifacts/
 *.svclog
 *.scc
 
-# ReSharper
+# Visual Studio profiler
+*.psess
+*.vsp
+*.vspx
+*.sap
+
+# ReSharper is a .NET coding add-in
 _ReSharper*/
 *.[Rr]e[Ss]harper
 *.DotSettings.user
 
-# Visual Studio code coverage results
-*.coverage
-*.coveragexml
-
-# NuGet Packages
-*.nupkg
-*.snupkg
-# The packages folder can be ignored because of Package Restore
-**/[Pp]ackages/*
-# except build/, which is used as an MSBuild target.
-!**/[Pp]ackages/build/
-
-# Local configuration files
-appsettings.Development.json
-appsettings.local.json
-*.local.json
-
-# Diagnostic logs
-pipe_diagnostics.log 
+# Application specific
+logs/
+*.sqlite
+*.db 
