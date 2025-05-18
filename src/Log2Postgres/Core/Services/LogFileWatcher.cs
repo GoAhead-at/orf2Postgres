@@ -9,6 +9,11 @@ using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.IO.Pipes;
+using System.Text;
+using Newtonsoft.Json;
+using System.Security.Principal;
+using System.Security.AccessControl;
 
 namespace Log2Postgres.Core.Services
 {
@@ -17,12 +22,17 @@ namespace Log2Postgres.Core.Services
     /// </summary>
     public class LogFileWatcher : BackgroundService
     {
+        private const string PipeName = "Log2PostgresServicePipe";
+        private Task? _ipcServerTask;
+        private CancellationTokenSource? _ipcServerCts;
+
         private readonly ILogger<LogFileWatcher> _logger;
         private readonly OrfLogParser _logParser;
         private readonly PositionManager _positionManager;
         private readonly PostgresService _postgresService;
         private readonly LogMonitorSettings _settings;
         private readonly IHostApplicationLifetime _appLifetime;
+        private readonly bool _isRunningAsHostedService;
         
         // Event to notify the UI or other services about processing status
         public event Action<string, int, long>? ProcessingStatusChanged;
@@ -52,6 +62,7 @@ namespace Log2Postgres.Core.Services
         
         // This is for the UI to show if we're in processing mode
         public bool IsProcessing { get; private set; } = false;
+        private string? _lastProcessingError = null;
         
         private readonly List<string> _pendingFiles = new();
         
@@ -61,7 +72,8 @@ namespace Log2Postgres.Core.Services
             PositionManager positionManager,
             PostgresService postgresService,
             IOptions<LogMonitorSettings> settings,
-            IHostApplicationLifetime appLifetime)
+            IHostApplicationLifetime appLifetime,
+            IOptions<WindowsServiceSettings> serviceSettingsOptions)
         {
             _logger = logger;
             _logParser = logParser;
@@ -69,12 +81,26 @@ namespace Log2Postgres.Core.Services
             _postgresService = postgresService;
             _settings = settings.Value;
             _appLifetime = appLifetime;
+
+            // Log the received RunAsService value directly from IOptions<WindowsServiceSettings>
+            if (serviceSettingsOptions != null && serviceSettingsOptions.Value != null)
+            {
+                _logger.LogInformation("LogFileWatcher Constructor: Received serviceSettingsOptions.Value.RunAsService = {RunAsServiceValue}", serviceSettingsOptions.Value.RunAsService);
+            }
+            else
+            {
+                _logger.LogWarning("LogFileWatcher Constructor: serviceSettingsOptions or serviceSettingsOptions.Value is null. Cannot determine RunAsService from options.");
+            }
+
+            _isRunningAsHostedService = serviceSettingsOptions?.Value?.RunAsService ?? false;
+            _logger.LogInformation("LogFileWatcher Constructor: _isRunningAsHostedService initialized to {IsRunningAsHostedServiceValue}", _isRunningAsHostedService);
         }
         
         // Helper method to notify UI about errors
         private void NotifyError(string component, string message)
         {
             _logger.LogError("{Component} error: {Message}", component, message);
+            _lastProcessingError = $"[{component}] {message}";
             ErrorOccurred?.Invoke(component, message);
         }
         
@@ -83,61 +109,60 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            _logger.LogInformation("LogFileWatcher service starting...");
-            
-            // Handle case when settings are not configured at startup
-            if (string.IsNullOrWhiteSpace(_settings.BaseDirectory))
+            _logger.LogInformation("LogFileWatcher ExecuteAsync ENTERED. IsRunningAsHostedService: {IsHosted}", _isRunningAsHostedService);
+
+            stoppingToken.Register(() => {
+                _logger.LogInformation("ExecuteAsync: Host's stoppingToken was cancelled. Current time: {Time}", DateTime.UtcNow);
+                _logger.LogInformation("ExecuteAsync: Cancelling internal _stoppingCts. Current time: {Time}", DateTime.UtcNow);
+                if (!_stoppingCts.IsCancellationRequested) _stoppingCts.Cancel(); // Ensure cancel only once
+                _logger.LogInformation("ExecuteAsync: Internal _stoppingCts cancellation requested. IsCancellationRequested: {IsCancelled}. Current time: {Time}", _stoppingCts.IsCancellationRequested, DateTime.UtcNow);
+            });
+
+            await InitialSetupAsync(_stoppingCts.Token);
+
+            if (_isRunningAsHostedService)
             {
-                _logger.LogInformation("BaseDirectory is not configured yet. Service is waiting for configuration.");
-                // Don't return here - just continue and wait for configuration to be set via UpdateSettingsAsync
+                _logger.LogInformation("Running as a hosted service. Automatically starting processing via internal StartProcessingAsync().");
+                // This will set IsProcessing = true and process existing files.
+                await StartProcessingAsyncInternal();
+
+                _logger.LogInformation("Starting IPC server task.");
+                _ipcServerCts = new CancellationTokenSource();
+                _ipcServerTask = Task.Run(() => RunIpcServerAsync(_ipcServerCts.Token), _ipcServerCts.Token);
             }
-            else
+            
+            _logger.LogDebug("Starting background polling task with _stoppingCts.Token. IsCancellationRequested initially: {IsCancelled}", _stoppingCts.Token.IsCancellationRequested);
+            await PollingLoopAsync(_stoppingCts.Token);
+
+            _logger.LogInformation("LogFileWatcher ExecuteAsync: PollingLoopAsync completed. Current time: {Time}", DateTime.UtcNow);
+            _logger.LogInformation("LogFileWatcher ExecuteAsync finished, service stopping... Current time: {Time}", DateTime.UtcNow);
+        }
+        
+        // New method to encapsulate initial setup
+        private async Task InitialSetupAsync(CancellationToken cancellationToken)
+        {
+            _logger.LogDebug("Performing initial setup...");
+            _lastProcessingError = null;
+            await SetupFileSystemWatcherAsync();
+
+            // Optional: Check database connection/table during service startup
+            try
             {
-                // Ensure the directory exists
-                if (!Directory.Exists(_settings.BaseDirectory))
+                if (cancellationToken.IsCancellationRequested) return;
+                if (!await _postgresService.TableExistsAsync())
                 {
-                    _logger.LogWarning("Base directory {BaseDirectory} does not exist.", _settings.BaseDirectory);
+                    NotifyError("Database", "Required database table does not exist. Service will run but data won't be saved.");
                 }
                 else
                 {
-                    // Initialize file system watcher since we have a valid directory
-                    await SetupFileSystemWatcherAsync();
-                    
-                    // No longer automatically processing existing files on startup
-                    // This will be done when StartProcessingAsync is called from the UI
-                    _logger.LogInformation("File watching initialized, waiting for user to start processing");
-                }
-            }
-            
-            // Ensure the database table exists
-            try 
-            {
-                _logger.LogDebug("Checking database table before starting service");
-                bool tableExists = await _postgresService.EnsureTableExistsAsync();
-                if (!tableExists)
-                {
-                    NotifyError("Database", "Failed to ensure database table exists. Service will run but data won't be saved.");
-                }
-                else
-                {
-                    _logger.LogDebug("Database table check completed successfully");
+                    _logger.LogInformation("Database table verified successfully.");
                 }
             }
             catch (Exception ex)
             {
                 NotifyError("Database", $"Error checking database table: {ex.Message}. Service will run but data won't be saved.");
             }
-            
-            // Start polling loop regardless of directory config - it will just skip processing if no directory is set
-            // or if processing hasn't been started by the user
-            _logger.LogDebug("Starting background polling task");
-            _ = Task.Run(() => PollingLoopAsync(stoppingToken), stoppingToken);
-            
-            // Wait for the application to stop
-            _logger.LogDebug("LogFileWatcher main task now waiting for cancellation");
-            await Task.Delay(Timeout.Infinite, stoppingToken);
-            
-            _logger.LogInformation("LogFileWatcher service stopping...");
+            _logger.LogDebug("Initial setup complete.");
         }
         
         /// <summary>
@@ -219,8 +244,8 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         private async Task PollingLoopAsync(CancellationToken cancellationToken)
         {
-            _logger.LogInformation("Starting polling loop with interval of {Interval} seconds", 
-                _settings.PollingIntervalSeconds);
+            _logger.LogInformation("Starting polling loop with interval of {Interval} seconds. IsProcessing: {IsProcessing}, IsRunningAsHostedService: {IsHosted}", 
+                _settings.PollingIntervalSeconds, IsProcessing, _isRunningAsHostedService);
             
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -253,7 +278,11 @@ namespace Log2Postgres.Core.Services
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Error in polling loop: {Message}", ex.Message);
-                    await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+                    NotifyError("PollingLoop", $"Error in polling loop: {ex.Message}");
+                    if (!cancellationToken.IsCancellationRequested)
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(Math.Max(5, _settings.PollingIntervalSeconds)), cancellationToken);
+                    }
                 }
             }
             
@@ -317,7 +346,7 @@ namespace Log2Postgres.Core.Services
                         fileInfo.Length, fileInfo.LastWriteTime);
                     
                     // Get last known position
-                    long lastPosition = await _positionManager.GetPositionAsync(currentLogFilePath);
+                    long lastPosition = await _positionManager.GetPositionAsync(currentLogFilePath, cancellationToken);
                     _logger.LogDebug("Last known position for current log file: {Position}", lastPosition);
                     
                     // Only process if the file has changed since our last check
@@ -347,7 +376,7 @@ namespace Log2Postgres.Core.Services
                             break;
                         
                         var fileInfo = new FileInfo(filePath);
-                        long lastPosition = await _positionManager.GetPositionAsync(filePath);
+                        long lastPosition = await _positionManager.GetPositionAsync(filePath, cancellationToken);
                         
                         if (fileInfo.Length > lastPosition)
                         {
@@ -380,16 +409,17 @@ namespace Log2Postgres.Core.Services
             
             try
             {
-                // Note: We don't set IsProcessing here anymore - that's controlled by StartProcessingAsync/StopProcessing
+                cancellationToken.ThrowIfCancellationRequested(); // Check at the beginning
+
                 CurrentFile = Path.GetFileName(filePath);
                 _logger.LogDebug("Processing log file {FilePath}", filePath);
                 
-                // Verify the file exists and has proper read permissions
                 if (!File.Exists(filePath))
                 {
                     _logger.LogWarning("File {FilePath} no longer exists, skipping processing", filePath);
                     return;
                 }
+                cancellationToken.ThrowIfCancellationRequested();
 
                 try
                 {
@@ -402,39 +432,37 @@ namespace Log2Postgres.Core.Services
                     _logger.LogDebug(ex, "Error getting file information: {Message}", ex.Message);
                 }
                 
-                // Get the last position we read from for this file
                 _logger.LogDebug("Retrieving last processing position for {FilePath}", filePath);
-                long startPosition = await _positionManager.GetPositionAsync(filePath);
+                long startPosition = await _positionManager.GetPositionAsync(filePath, cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
                 CurrentPosition = startPosition;
                 _logger.LogDebug("Starting from position {Position} in file {FilePath}", startPosition, filePath);
                 
-                // Parse the log file from that position
                 _logger.LogDebug("Parsing log file {FilePath} from position {Position}", filePath, startPosition);
                 var (entries, newPosition) = _logParser.ParseLogFile(filePath, startPosition);
+                cancellationToken.ThrowIfCancellationRequested(); // Check after potentially long synchronous operation
                 _logger.LogDebug("Parsed {Count} entries from {FilePath}, new position: {NewPosition}", 
                     entries.Count, filePath, newPosition);
                 
                 if (entries.Count > 0)
                 {
-                    // Update statistics
                     TotalLinesProcessed += entries.Count;
                     CurrentPosition = newPosition;
                     LastProcessedTime = DateTime.Now;
                     
-                    // Save the new position
                     _logger.LogDebug("Updating position tracker for {FilePath} to position {Position}", filePath, newPosition);
-                    await _positionManager.UpdatePositionAsync(filePath, newPosition);
+                    await _positionManager.UpdatePositionAsync(filePath, newPosition, cancellationToken);
+                    cancellationToken.ThrowIfCancellationRequested();
                     
-                    // Notify listeners
                     _logger.LogDebug("Notifying UI of processing status update");
                     ProcessingStatusChanged?.Invoke(CurrentFile, entries.Count, newPosition);
                     EntriesProcessed?.Invoke(entries);
                     
-                    // Save entries to database
                     try
                     {
                         _logger.LogDebug("Saving {Count} log entries to database", entries.Count);
-                        int savedEntries = await _postgresService.SaveEntriesAsync(entries);
+                        int savedEntries = await _postgresService.SaveEntriesAsync(entries, cancellationToken);
+                        cancellationToken.ThrowIfCancellationRequested();
                         EntriesSavedToDb += savedEntries;
                         
                         if (savedEntries != entries.Count)
@@ -593,25 +621,219 @@ namespace Log2Postgres.Core.Services
         }
         
         /// <summary>
-        /// Stop the service gracefully
+        /// Handles IPC requests from the UI.
         /// </summary>
+        private async Task RunIpcServerAsync(CancellationToken cancellationToken)
+        {
+            _logger.LogInformation("IPC Server starting. Pipe name: {PipeName}", PipeName);
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                NamedPipeServerStream pipeServer = null;
+                try
+                {
+                    _logger.LogDebug("IPC Server: Preparing PipeSecurity for Authenticated Users.");
+                    // Define the pipe security
+                    PipeSecurity pipeSecurity = new PipeSecurity();
+                    // Grant access to "Authenticated Users"
+                    SecurityIdentifier authenticatedUsersSid = new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null);
+                    PipeAccessRule accessRule = new PipeAccessRule(authenticatedUsersSid, PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance, AccessControlType.Allow);
+                    pipeSecurity.AddAccessRule(accessRule);
+                    _logger.LogInformation("IPC Server: PipeSecurity object created for 'Authenticated Users'.");
+
+                    _logger.LogDebug("IPC Server: Attempting to create NamedPipeServerStream '{PipeName}' using NamedPipeServerStreamAcl.Create with PipeSecurity.", PipeName);
+                    pipeServer = NamedPipeServerStreamAcl.Create(
+                        PipeName, 
+                        PipeDirection.InOut, 
+                        1, // MaxNumberOfServerInstances
+                        PipeTransmissionMode.Byte, 
+                        PipeOptions.Asynchronous,
+                        0, // inBufferSize (0 for default)
+                        0, // outBufferSize (0 for default)
+                        pipeSecurity,
+                        HandleInheritability.None // Default inheritability
+                        // additionalAccessRights defaults to 0, which is fine
+                    );
+                    _logger.LogInformation("IPC Server: NamedPipeServerStream object created for pipe '{PipeName}' via NamedPipeServerStreamAcl.Create.", PipeName);
+
+                    _logger.LogInformation("IPC Server: Waiting for a client connection on pipe '{PipeName}'...", PipeName);
+                    await pipeServer.WaitForConnectionAsync(cancellationToken);
+                    _logger.LogInformation("IPC Server: Client connected to pipe '{PipeName}'.", PipeName);
+
+                    try
+                    {
+                        // Read request from client
+                        byte[] buffer = new byte[1024];
+                        int bytesRead = await pipeServer.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+                        string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                        _logger.LogDebug("IPC Server: Received request: {Request}", request);
+
+                        if (request == "GET_STATUS")
+                        {
+                            var statusResponse = new
+                            {
+                                ServiceOperationalState = GetOperationalStateString(),
+                                IsProcessing = this.IsProcessing,
+                                CurrentFile = this.CurrentFile,
+                                CurrentPosition = this.CurrentPosition,
+                                TotalLinesProcessedSinceStart = (long)this.TotalLinesProcessed,
+                                LastErrorMessage = _lastProcessingError ?? string.Empty
+                            };
+                            _logger.LogDebug("IPC SERVER: Sending status. LastErrorMessage: '{ErrorMessage}', OperationalState: '{OpState}'", statusResponse.LastErrorMessage, statusResponse.ServiceOperationalState);
+                            string response = JsonConvert.SerializeObject(statusResponse);
+                            byte[] responseBytes = Encoding.UTF8.GetBytes(response);
+                            await pipeServer.WriteAsync(responseBytes, 0, responseBytes.Length, cancellationToken);
+                            await pipeServer.FlushAsync(cancellationToken);
+                            _logger.LogDebug("IPC Server: Sent status response: {JsonResponse}", response);
+                        }
+                        else if (request.StartsWith("UPDATE_SETTINGS:"))
+                        {
+                            _logger.LogInformation("IPC Server: Received UPDATE_SETTINGS request.");
+                            try
+                            {
+                                string settingsJson = request.Substring("UPDATE_SETTINGS:".Length);
+                                LogMonitorSettings? newSettings = JsonConvert.DeserializeObject<LogMonitorSettings>(settingsJson);
+                                if (newSettings != null)
+                                {
+                                    _logger.LogInformation("IPC Server: Deserialized settings for update - BaseDir: {BaseDir}, Pattern: {Pattern}, Interval: {Interval}", 
+                                        newSettings.BaseDirectory, newSettings.LogFilePattern, newSettings.PollingIntervalSeconds);
+                                    await UpdateSettingsAsync(newSettings);
+                                    // Send a simple ACK response
+                                    byte[] ackBytes = Encoding.UTF8.GetBytes("ACK_UPDATE_SETTINGS");
+                                    await pipeServer.WriteAsync(ackBytes, 0, ackBytes.Length, cancellationToken);
+                                    await pipeServer.FlushAsync(cancellationToken);
+                                    _logger.LogInformation("IPC Server: Sent ACK_UPDATE_SETTINGS to client.");
+                                }
+                                else
+                                {
+                                    _logger.LogError("IPC Server: Failed to deserialize settings from UPDATE_SETTINGS request. JSON: {Json}", settingsJson);
+                                    byte[] nackBytes = Encoding.UTF8.GetBytes("NACK_UPDATE_SETTINGS_DESERIALIZATION_ERROR");
+                                    await pipeServer.WriteAsync(nackBytes, 0, nackBytes.Length, cancellationToken);
+                                    await pipeServer.FlushAsync(cancellationToken);
+                                }
+                            }
+                            catch (JsonException jsonEx)
+                            {
+                                _logger.LogError(jsonEx, "IPC Server: JSON deserialization error for UPDATE_SETTINGS.");
+                                byte[] nackBytes = Encoding.UTF8.GetBytes("NACK_UPDATE_SETTINGS_JSON_ERROR");
+                                await pipeServer.WriteAsync(nackBytes, 0, nackBytes.Length, cancellationToken);
+                                await pipeServer.FlushAsync(cancellationToken);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "IPC Server: Error processing UPDATE_SETTINGS request.");
+                                byte[] nackBytes = Encoding.UTF8.GetBytes("NACK_UPDATE_SETTINGS_GENERAL_ERROR");
+                                await pipeServer.WriteAsync(nackBytes, 0, nackBytes.Length, cancellationToken);
+                                await pipeServer.FlushAsync(cancellationToken);
+                            }
+                        }
+                        else
+                        {
+                            _logger.LogWarning("IPC Server: Received unknown request: {Request}", request);
+                        }
+                    }
+                    catch (IOException ex)
+                    {
+                        _logger.LogError(ex, "IPC Server: IOException during client communication on pipe '{PipeName}'. Client may have disconnected.", PipeName);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "IPC Server: Exception during client communication on pipe '{PipeName}'.", PipeName);
+                    }
+                    finally
+                    {
+                        if (pipeServer.IsConnected)
+                        {
+                            _logger.LogDebug("IPC Server: Disconnecting client.");
+                            pipeServer.Disconnect();
+                        }
+                        pipeServer.Dispose(); // Ensure pipe server is disposed
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogInformation("IPC Server: Operation cancelled (likely service stopping) for pipe '{PipeName}'. Shutting down IPC server loop.", PipeName);
+                    pipeServer?.Dispose(); // Dispose if created before cancellation
+                    break; // Exit loop if cancellation is requested
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "IPC Server: Unhandled critical exception in server loop for pipe '{PipeName}'. This may affect pipe availability.", PipeName);
+                    pipeServer?.Dispose(); // Dispose on error too
+                    // Avoid fast spinning on repeated errors if pipe creation fails, by adding a small delay.
+                    if (!cancellationToken.IsCancellationRequested)
+                    {
+                         await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken);
+                    }
+                }
+            }
+            _logger.LogInformation("IPC Server stopped for pipe '{PipeName}'.", PipeName);
+        }
+
         public override async Task StopAsync(CancellationToken cancellationToken)
         {
-            _logger.LogInformation("Stopping LogFileWatcher service...");
-            
-            if (_fileSystemWatcher != null)
+            _logger.LogInformation("LogFileWatcher Service StopAsync CALLED. Current time: {Time}", DateTime.UtcNow);
+
+            _logger.LogInformation("StopAsync: Cancelling _applicationStopping (internal _stoppingCts). Current time: {Time}", DateTime.UtcNow);
+            if (!_stoppingCts.IsCancellationRequested) _stoppingCts.Cancel(); // Ensure cancel only once
+            _logger.LogInformation("StopAsync: _applicationStopping cancellation requested. IsCancellationRequested: {IsCancelled}. Current time: {Time}", _stoppingCts.IsCancellationRequested, DateTime.UtcNow);
+
+            // Stop the IPC Server
+            if (_ipcServerTask != null && !_ipcServerTask.IsCompleted)
             {
-                _fileSystemWatcher.EnableRaisingEvents = false;
-                _fileSystemWatcher.Changed -= OnFileChanged;
-                _fileSystemWatcher.Created -= OnFileCreated;
-                _fileSystemWatcher.Dispose();
+                _logger.LogDebug("StopAsync: Attempting to gracefully shutdown IPC server... Current time: {Time}", DateTime.UtcNow);
+                if (_ipcServerCts != null && !_ipcServerCts.IsCancellationRequested)
+                {
+                    _logger.LogDebug("StopAsync: Requesting cancellation of _ipcServerCts. Current time: {Time}", DateTime.UtcNow);
+                    _ipcServerCts.Cancel();
+                }
+                try
+                {
+                    // Give IPC server a short time to shutdown based on SCM's token for the delay itself
+                    await Task.WhenAny(_ipcServerTask, Task.Delay(TimeSpan.FromSeconds(5), cancellationToken)); 
+                    if (_ipcServerTask.IsCompleted)
+                    {
+                        _logger.LogInformation("StopAsync: IPC Server task completed. Current time: {Time}", DateTime.UtcNow);
+                    }
+                    else
+                    {
+                        _logger.LogWarning("StopAsync: IPC Server task did not complete within 5s. Current time: {Time}", DateTime.UtcNow);
+                    }
+                }
+                catch(OperationCanceledException)
+                {
+                    _logger.LogInformation("StopAsync: IPC server shutdown delay was cancelled by SCM token. Current time: {Time}", DateTime.UtcNow);
+                }
+                 catch (Exception ex)
+                {
+                    _logger.LogError(ex, "StopAsync: Exception during IPC server shutdown. Current time: {Time}", DateTime.UtcNow);
+                }
+            }
+            else
+            {
+                _logger.LogDebug("StopAsync: IPC server task is null or already completed. Current time: {Time}", DateTime.UtcNow);
             }
             
-            _stoppingCts.Cancel();
+            _logger.LogInformation("StopAsync: Signalled internal components to stop. ExecuteAsync should be unwinding based on its token. Current time: {Time}", DateTime.UtcNow);
+            // Removed problematic _processingTask wait. The host manages ExecuteAsync's lifetime via its stoppingToken.
+
+            // Perform any other synchronous, quick cleanup needed by LogFileWatcher itself.
+            // Example: if _fileSystemWatcher needs disposal (though it might be better in Dispose method if IDisposable)
+            if (_fileSystemWatcher != null)
+            {
+                _logger.LogDebug("StopAsync: Disabling and disposing FileSystemWatcher. Current time: {Time}", DateTime.UtcNow);
+                _fileSystemWatcher.EnableRaisingEvents = false;
+                _fileSystemWatcher.Dispose(); // Dispose it here if it's managed by this class's lifecycle
+                _fileSystemWatcher = null; // Avoid reuse
+            }
+
+            // Removed call to _positionManager.SaveAllPositionsAsync(); 
+            // Position saving should ideally happen during processing or via PositionManager's own disposal if applicable.
+            // If an explicit final save is critical and not handled elsewhere, a correct, quick method call would be needed.
+            _logger.LogInformation("StopAsync: Pre-base.StopAsync cleanup finished. Current time: {Time}", DateTime.UtcNow);
+
+            await base.StopAsync(cancellationToken); // Call base.StopAsync as required by the framework
             
-            await base.StopAsync(cancellationToken);
-            
-            _logger.LogInformation("LogFileWatcher service stopped");
+            _logger.LogInformation("LogFileWatcher Service StopAsync COMPLETED. Current time: {Time}", DateTime.UtcNow);
         }
         
         /// <summary>
@@ -620,38 +842,63 @@ namespace Log2Postgres.Core.Services
         /// <param name="newSettings">The new settings to use</param>
         public async Task UpdateSettingsAsync(LogMonitorSettings newSettings)
         {
-            _logger.LogInformation("Updating LogFileWatcher settings");
+            _logger.LogInformation("Updating LogFileWatcher settings. Current IsProcessing: {IsProcessingValue}", IsProcessing);
+            _logger.LogInformation("UpdateSettingsAsync received newSettings - BaseDirectory: '{NewBaseDir}', Pattern: '{NewPattern}', Interval: {NewInterval}", 
+                newSettings.BaseDirectory, newSettings.LogFilePattern, newSettings.PollingIntervalSeconds);
             
-            // Compare with current settings to see what changed
-            bool directoryChanged = !string.Equals(_settings.BaseDirectory, newSettings.BaseDirectory, StringComparison.OrdinalIgnoreCase);
-            bool patternChanged = _settings.LogFilePattern != newSettings.LogFilePattern;
-            bool pollingIntervalChanged = _settings.PollingIntervalSeconds != newSettings.PollingIntervalSeconds;
-            
-            // Since _settings is readonly, we need to update its properties
-            // Rather than replacing the entire object
-            typeof(LogMonitorSettings).GetProperty(nameof(LogMonitorSettings.BaseDirectory)).SetValue(_settings, newSettings.BaseDirectory);
-            typeof(LogMonitorSettings).GetProperty(nameof(LogMonitorSettings.LogFilePattern)).SetValue(_settings, newSettings.LogFilePattern);
-            typeof(LogMonitorSettings).GetProperty(nameof(LogMonitorSettings.PollingIntervalSeconds)).SetValue(_settings, newSettings.PollingIntervalSeconds);
+            // Store the state before updates for comparison
+            bool wasProcessingBeforeUpdate = IsProcessing;
+            string? oldBaseDirectory = _settings.BaseDirectory;
+
+            // Update the internal settings object.
+            _settings.BaseDirectory = newSettings.BaseDirectory;
+            _settings.LogFilePattern = newSettings.LogFilePattern;
+            _settings.PollingIntervalSeconds = newSettings.PollingIntervalSeconds;
             
             _logger.LogDebug("Settings updated - BaseDirectory: {BaseDirectory}, LogFilePattern: {LogFilePattern}, PollingInterval: {PollingInterval}s",
                 _settings.BaseDirectory, _settings.LogFilePattern, _settings.PollingIntervalSeconds);
-            
-            // If directory or pattern changed, we need to update file system watcher
-            if (directoryChanged || patternChanged)
+
+            bool directoryChanged = !string.Equals(oldBaseDirectory, _settings.BaseDirectory, StringComparison.OrdinalIgnoreCase);
+
+            if (directoryChanged) // Re-setup watcher if directory changed
             {
-                // Use our centralized setup method
+                _logger.LogDebug("Directory changed, re-evaluating FileSystemWatcher.");
                 await SetupFileSystemWatcherAsync();
             }
             
-            // Only process existing files if processing is already active
-            if (IsProcessing && directoryChanged && !string.IsNullOrWhiteSpace(_settings.BaseDirectory) && Directory.Exists(_settings.BaseDirectory))
+            // Logic to handle starting or stopping processing based on directory validity
+            if (directoryChanged)
             {
-                _logger.LogInformation("Directory changed while processing is active, processing existing files in new directory");
-                await ProcessExistingFilesAsync(_stoppingCts.Token);
-            }
-            else if (directoryChanged && !string.IsNullOrWhiteSpace(_settings.BaseDirectory) && Directory.Exists(_settings.BaseDirectory))
-            {
-                _logger.LogInformation("Directory changed, but processing is not active (IsProcessing: {IsProcessing}). Files will be processed when processing is started.", IsProcessing);
+                bool newDirectoryIsValid = !string.IsNullOrWhiteSpace(_settings.BaseDirectory) && Directory.Exists(_settings.BaseDirectory);
+
+                if (newDirectoryIsValid)
+                {
+                    if (!wasProcessingBeforeUpdate) // If processing was NOT active before this settings update
+                    {
+                        _logger.LogInformation("Valid log directory '{NewDir}' configured and processing was not active. Attempting to start processing.", _settings.BaseDirectory);
+                        IsProcessing = true; // Set processing to active
+                        _lastProcessingError = null; // Clear any previous config error
+                        ErrorOccurred?.Invoke("Configuration", null); // Notify UI that error is cleared
+
+                        // Now process existing files and allow polling loop to take over
+                        await InitializeAndProcessFilesOnStartAsync(_stoppingCts.Token);
+                        _logger.LogInformation("Processing automatically started after configuration update. Polling loop will now be active.");
+                    }
+                    else // Processing was already active, and directory changed to another valid one
+                    {
+                         _logger.LogInformation("Directory changed to '{NewDir}' while processing is active. Re-processing existing files in new directory.", _settings.BaseDirectory);
+                         await ProcessExistingFilesAsync(_stoppingCts.Token);
+                    }
+                }
+                else // New directory is invalid (cleared or non-existent)
+                {
+                    _logger.LogWarning("Log directory configuration became invalid or was cleared ('{NewDir}').", _settings.BaseDirectory);
+                    if (IsProcessing) // If it was processing, stop it
+                    {
+                        IsProcessing = false;
+                        NotifyError("Configuration", "Log directory became invalid or was cleared. Processing stopped.");
+                    }
+                }
             }
         }
         
@@ -670,17 +917,17 @@ namespace Log2Postgres.Core.Services
         }
         
         /// <summary>
-        /// Start processing log files
+        /// Start processing log files (typically called by UI or for auto-start)
         /// </summary>
         /// <returns>Task representing the operation</returns>
-        public async Task StartProcessingAsync()
+        private async Task StartProcessingAsyncInternal()
         {
             if (IsProcessing)
             {
-                _logger.LogWarning("Processing is already running, ignoring start request");
+                _logger.LogWarning("Processing is already active, internal start request ignored.");
                 return;
             }
-            
+
             if (string.IsNullOrWhiteSpace(_settings.BaseDirectory))
             {
                 _logger.LogWarning("Cannot start processing - no directory configured");
@@ -695,38 +942,85 @@ namespace Log2Postgres.Core.Services
                 return;
             }
             
-            // Check if positions file exists and handle if it doesn't
             if (!_positionManager.PositionsFileExists())
             {
                 _logger.LogWarning("Positions file doesn't exist at startup. Will create a new one with initial positions.");
-                // The PositionManager will create a new file with initial positions (0) when methods are called
             }
             
-            // Set processing state to true
             IsProcessing = true;
-            _logger.LogInformation("Starting log file processing...");
+            _logger.LogInformation("Log file processing has been set to ACTIVE (IsProcessing: {IsProcessing}) by StartProcessingAsyncInternal.", IsProcessing);
             
-            // Immediately get the current day's log file and notify the UI
+            await InitializeAndProcessFilesOnStartAsync(_stoppingCts.Token);
+            
+            _logger.LogInformation("Initial file processing complete (if any files were found). Polling loop will continue if service is running.");
+        }
+
+        // New method for UI-initiated start
+        public async Task UIManagedStartProcessingAsync()
+        {
+            if (_isRunningAsHostedService)
+            {
+                _logger.LogWarning("Application is running as a hosted service. UI cannot directly start processing. Use IPC (not yet implemented).");
+                NotifyError("Service Control", "Cannot start from UI when running as a dedicated service. Control via service management or IPC.");
+                return;
+            }
+
+            if (IsProcessing)
+            {
+                _logger.LogWarning("Processing is already running (UI mode), ignoring start request.");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(_settings.BaseDirectory))
+            {
+                _logger.LogWarning("Cannot start processing - no directory configured (UI mode)");
+                NotifyError("Configuration", "Log directory is not configured. Please configure a directory first.");
+                return;
+            }
+            
+            if (!Directory.Exists(_settings.BaseDirectory))
+            {
+                _logger.LogWarning("Cannot start processing - directory {Directory} does not exist (UI mode)", _settings.BaseDirectory);
+                NotifyError("File System", $"Directory {_settings.BaseDirectory} does not exist. Please check the configuration.");
+                return;
+            }
+
+            if (!_positionManager.PositionsFileExists())
+            {
+                _logger.LogWarning("Positions file doesn't exist at UI start. Will create a new one.");
+            }
+
+            IsProcessing = true;
+            _logger.LogInformation("Log file processing started by UI. IsProcessing: {IsProcessing}", IsProcessing);
+            
+            await InitializeAndProcessFilesOnStartAsync(_stoppingCts.Token);
+            
+            _logger.LogInformation("UI-initiated processing started and initial files processed.");
+            if (!_isRunningAsHostedService)
+            {
+                _logger.LogInformation("UI Mode: Kicking off PollingLoopAsync as ExecuteAsync is not managing it.");
+                 _ = Task.Run(() => PollingLoopAsync(_stoppingCts.Token), _stoppingCts.Token);
+            }
+        }
+        
+        // Helper for initializing files on start (used by both service auto-start and UI start)
+        private async Task InitializeAndProcessFilesOnStartAsync(CancellationToken cancellationToken)
+        {
+             // Immediately get the current day's log file and notify the UI
             string currentLogFile = GetCurrentLogFilePath();
             if (File.Exists(currentLogFile))
             {
                 CurrentFile = Path.GetFileName(currentLogFile);
-                
-                // Get the current position (either 0 or from the position manager)
                 long position = await _positionManager.GetPositionAsync(currentLogFile);
                 CurrentPosition = position;
-                
-                // Notify UI immediately to update status display
-                _logger.LogInformation("Processing started with current file: {CurrentFile}, position: {CurrentPosition}", CurrentFile, CurrentPosition);
+                _logger.LogInformation("Initial state - Current file: {CurrentFile}, position: {CurrentPosition}", CurrentFile, CurrentPosition);
                 ProcessingStatusChanged?.Invoke(CurrentFile, 0, CurrentPosition);
             }
             else
             {
-                // If today's file doesn't exist, try to find the most recent matching log file
                 string[] matchingFiles = GetMatchingLogFiles();
                 if (matchingFiles.Length > 0)
                 {
-                    // Sort by last modified date to get the most recent file
                     string mostRecentFile = matchingFiles
                         .OrderByDescending(f => new FileInfo(f).LastWriteTime)
                         .FirstOrDefault();
@@ -734,98 +1028,59 @@ namespace Log2Postgres.Core.Services
                     if (mostRecentFile != null)
                     {
                         CurrentFile = Path.GetFileName(mostRecentFile);
-                        
-                        // Get the position for this file
                         long position = await _positionManager.GetPositionAsync(mostRecentFile);
                         CurrentPosition = position;
-                        
-                        // Notify UI immediately
-                        _logger.LogInformation("Processing started with most recent file: {CurrentFile}, position: {CurrentPosition}", CurrentFile, CurrentPosition);
+                        _logger.LogInformation("Initial state - Most recent file: {CurrentFile}, position: {CurrentPosition}", CurrentFile, CurrentPosition);
                         ProcessingStatusChanged?.Invoke(CurrentFile, 0, CurrentPosition);
                     }
-                    else
-                    {
-                        // This shouldn't happen, but just in case
-                        _logger.LogWarning("No valid log files found to process");
-                        
-                        // Notify UI with empty values
-                        ProcessingStatusChanged?.Invoke("Waiting for log files...", 0, 0);
-                    }
+                    else { ProcessingStatusChanged?.Invoke("Waiting for log files...", 0, 0); }
                 }
-                else
-                {
-                    _logger.LogInformation("No matching log files found. Waiting for new files.");
-                    
-                    // Notify UI that we're waiting for files
-                    ProcessingStatusChanged?.Invoke("Waiting for log files...", 0, 0);
-                }
+                else { ProcessingStatusChanged?.Invoke("Waiting for log files...", 0, 0); }
             }
             
             // Process any existing files
-            await ProcessExistingFilesAsync(_stoppingCts.Token);
-            
-            _logger.LogInformation("Processing started");
-        }
-        
-        /// <summary>
-        /// Stop processing log files
-        /// </summary>
-        public void StopProcessing()
-        {
-            if (!IsProcessing)
+            if (!cancellationToken.IsCancellationRequested)
             {
-                _logger.LogWarning("Processing is not running, ignoring stop request");
+                await ProcessExistingFilesAsync(cancellationToken);
+            }
+        }
+
+        // New method for UI-initiated stop
+        public void UIManagedStopProcessing()
+        {
+            if (_isRunningAsHostedService)
+            {
+                _logger.LogWarning("Application is running as a hosted service. UI cannot directly stop processing. Use IPC (not yet implemented).");
+                NotifyError("Service Control", "Cannot stop from UI when running as a dedicated service. Control via service management or IPC.");
                 return;
             }
-            
-            _logger.LogInformation("Stopping processing. Current _isProcessingFile lock value: {LockValue}", _isProcessingFile);
-            
-            // Set the flag to stop future processing, but let current processing complete
-            IsProcessing = false;
-            
-            // If there's a file currently being processed, log that information
-            if (_isProcessingFile == 1)
+
+            if (!IsProcessing)
             {
-                _logger.LogInformation("A file is currently being processed. It will complete before processing stops fully.");
+                _logger.LogWarning("Processing is not currently active (UI mode), ignoring stop request.");
+                return;
+            }
+
+            IsProcessing = false;
+            _logger.LogInformation("Log file processing stopped by UI. IsProcessing: {IsProcessing}", IsProcessing);
+            
+            ResetPositionInfo();
+        }
+
+        private string GetOperationalStateString()
+        {
+            if (IsProcessing)
+            {
+                return "Processing";
+            }
+            else if (!string.IsNullOrEmpty(_lastProcessingError))
+            {
+                return "Error";
             }
             else
             {
-                // Force reset the processing lock flag only if no file is being processed
-                Interlocked.Exchange(ref _isProcessingFile, 0);
+                return "Idle";
             }
-            
-            // Clear any pending files since we're not processing anymore
-            lock (_pendingFiles)
-            {
-                if (_pendingFiles.Count > 0)
-                {
-                    _logger.LogInformation("Clearing {Count} pending files from the queue as processing has stopped", _pendingFiles.Count);
-                    _pendingFiles.Clear();
-                }
-            }
-            
-            _logger.LogInformation("Processing stopped");
-        }
-        
-        /// <summary>
-        /// Get the current processing state
-        /// </summary>
-        /// <returns>True if the watcher is currently processing, false otherwise</returns>
-        public bool GetProcessingState()
-        {
-            _logger.LogDebug("Getting processing state: {IsProcessing}", IsProcessing);
-            return IsProcessing;
-        }
-        
-        /// <summary>
-        /// Set the processing state directly (without starting or stopping processing)
-        /// This is mainly for synchronizing UI state with actual processing state
-        /// </summary>
-        /// <param name="isProcessing">The desired processing state</param>
-        public void SetProcessingState(bool isProcessing)
-        {
-            _logger.LogInformation("Setting processing state directly to {IsProcessing}", isProcessing);
-            IsProcessing = isProcessing;
         }
     }
     

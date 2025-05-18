@@ -50,7 +50,7 @@ namespace Log2Postgres.Core.Services
                 byte[] encryptedBytes = ProtectedData.Protect(
                     passwordBytes, 
                     entropyBytes, 
-                    DataProtectionScope.CurrentUser);
+                    DataProtectionScope.LocalMachine);
                 
                 // Convert to Base64 for storage
                 string encryptedPassword = Convert.ToBase64String(encryptedBytes);
@@ -90,7 +90,7 @@ namespace Log2Postgres.Core.Services
                 byte[] decryptedBytes = ProtectedData.Unprotect(
                     encryptedBytes, 
                     entropyBytes, 
-                    DataProtectionScope.CurrentUser);
+                    DataProtectionScope.LocalMachine);
                 
                 // Convert back to a string
                 string decryptedPassword = Encoding.UTF8.GetString(decryptedBytes);

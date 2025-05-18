@@ -4,6 +4,7 @@ using Microsoft.Extensions.Options;
 using Npgsql;
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Log2Postgres.Core.Services
@@ -402,8 +403,9 @@ namespace Log2Postgres.Core.Services
         /// <summary>
         /// Saves a batch of log entries to the database
         /// </summary>
-        public async Task<int> SaveEntriesAsync(IEnumerable<OrfLogEntry> entries)
+        public async Task<int> SaveEntriesAsync(IEnumerable<OrfLogEntry> entries, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var entriesList = entries.ToList();
             _logger.LogDebug("Attempting to save {Count} log entries to database", entriesList.Count);
             
@@ -411,16 +413,17 @@ namespace Log2Postgres.Core.Services
             {
                 using var connection = new NpgsqlConnection(_connectionString);
                 _logger.LogDebug("Opening database connection for batch insert");
-                await connection.OpenAsync();
+                await connection.OpenAsync(cancellationToken);
                 
                 int count = 0;
-                using (var transaction = await connection.BeginTransactionAsync())
+                using (var transaction = await connection.BeginTransactionAsync(cancellationToken))
                 {
                     _logger.LogDebug("Transaction started for batch insert");
                     try
                     {
                         foreach (var entry in entriesList)
                         {
+                            cancellationToken.ThrowIfCancellationRequested();
                             // Skip system messages (no message ID)
                             if (entry.IsSystemMessage)
                             {
@@ -465,7 +468,7 @@ namespace Log2Postgres.Core.Services
                             cmd.Parameters.AddWithValue("filename", entry.SourceFilename);
                             cmd.Parameters.AddWithValue("processed_at", entry.ProcessedAt);
                             
-                            await cmd.ExecuteNonQueryAsync();
+                            await cmd.ExecuteNonQueryAsync(cancellationToken);
                             count++;
                             
                             if (count % 100 == 0)
@@ -475,18 +478,29 @@ namespace Log2Postgres.Core.Services
                         }
                         
                         _logger.LogDebug("Committing transaction with {Count} entries", count);
-                        await transaction.CommitAsync();
+                        await transaction.CommitAsync(cancellationToken);
                         _logger.LogInformation("Saved {Count} log entries to database", count);
+                    }
+                    catch (OperationCanceledException) // Specifically catch OperationCanceledException
+                    {
+                        _logger.LogInformation("SaveEntriesAsync was cancelled during transaction. Rolling back.");
+                        await transaction.RollbackAsync(CancellationToken.None); // Use CancellationToken.None for rollback if original token is already cancelled
+                        throw; // Re-throw the cancellation exception
                     }
                     catch (Exception ex)
                     {
                         _logger.LogDebug("Error during batch insert, rolling back transaction");
-                        await transaction.RollbackAsync();
+                        await transaction.RollbackAsync(CancellationToken.None); // Use CancellationToken.None for rollback
                         throw new Exception($"Error saving entries, transaction rolled back: {ex.Message}", ex);
                     }
                 }
                 
                 return count;
+            }
+            catch (OperationCanceledException) // Catch OperationCanceledException if OpenAsync or BeginTransactionAsync is cancelled
+            {
+                _logger.LogInformation("SaveEntriesAsync was cancelled before or during transaction setup.");
+                throw; // Re-throw the cancellation exception
             }
             catch (Exception ex)
             {

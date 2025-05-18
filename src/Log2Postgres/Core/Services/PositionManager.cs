@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Reflection;
+using System.Text.RegularExpressions;
 
 namespace Log2Postgres.Core.Services
 {
@@ -41,19 +42,21 @@ namespace Log2Postgres.Core.Services
         /// Gets the last known position for a file
         /// </summary>
         /// <param name="filePath">Full path to the file</param>
+        /// <param name="cancellationToken">Cancellation token</param>
         /// <returns>Last known position (0 if not previously tracked)</returns>
-        public async Task<long> GetPositionAsync(string filePath)
+        public async Task<long> GetPositionAsync(string filePath, CancellationToken cancellationToken = default)
         {
             // First check if positions file exists, if not recreate it
             if (!PositionsFileExists())
             {
                 _logger.LogWarning("Positions file does not exist when getting position. Creating a new one.");
-                await EnsurePositionsFileExistsAsync();
+                await EnsurePositionsFileExistsAsync(cancellationToken);
             }
             
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(cancellationToken);
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 string key = GetNormalizedPath(filePath);
                 if (_positions.TryGetValue(key, out FilePosition? position))
                 {
@@ -79,12 +82,14 @@ namespace Log2Postgres.Core.Services
         /// <summary>
         /// Ensures the positions file exists, creating it with default values if it doesn't
         /// </summary>
+        /// <param name="cancellationToken">Cancellation token</param>
         /// <returns>Task representing the async operation</returns>
-        private async Task EnsurePositionsFileExistsAsync()
+        private async Task EnsurePositionsFileExistsAsync(CancellationToken cancellationToken = default)
         {
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(cancellationToken);
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!File.Exists(_positionsFilePath))
                 {
                     _logger.LogInformation("Positions file does not exist. Creating a new one with default values.");
@@ -93,7 +98,7 @@ namespace Log2Postgres.Core.Services
                     _positions = new Dictionary<string, FilePosition>();
                     
                     // Save the empty positions file
-                    await SavePositionsAsync();
+                    await SavePositionsAsync(cancellationToken);
                     
                     // Notify that positions were reset
                     PositionsLoaded?.Invoke(false);
@@ -191,7 +196,7 @@ namespace Log2Postgres.Core.Services
                         // Create the positions file with default values
                         try
                         {
-                            SavePositionsAsync().Wait();
+                            SavePositionsAsync(CancellationToken.None).GetAwaiter().GetResult();
                             _logger.LogInformation("Created new positions file at {FilePath}", _positionsFilePath);
                         }
                         catch (Exception saveEx)
@@ -230,31 +235,30 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         /// <param name="filePath">Full path to the file</param>
         /// <param name="position">New position in bytes</param>
+        /// <param name="cancellationToken">Cancellation token</param>
         /// <returns>Task representing the async operation</returns>
-        public async Task UpdatePositionAsync(string filePath, long position)
+        public async Task UpdatePositionAsync(string filePath, long position, CancellationToken cancellationToken = default)
         {
             // First check if positions file exists, if not recreate it
             if (!PositionsFileExists())
             {
                 _logger.LogWarning("Positions file does not exist when updating position. Creating a new one.");
-                await EnsurePositionsFileExistsAsync();
+                await EnsurePositionsFileExistsAsync(cancellationToken);
             }
             
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(cancellationToken);
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 string key = GetNormalizedPath(filePath);
                 
                 // Extract date from filename (assuming format orfee-yyyy-MM-dd.log)
                 DateTime fileDate = DateTime.Now;
                 string filename = Path.GetFileName(filePath);
-                if (filename.StartsWith("orfee-") && filename.EndsWith(".log"))
+                var match = Regex.Match(filename, @"(\d{4}-\d{2}-\d{2})");
+                if (match.Success && DateTime.TryParse(match.Groups[1].Value, out DateTime parsed))
                 {
-                    string dateStr = filename.Substring(6, 10);
-                    if (DateTime.TryParse(dateStr, out DateTime parsed))
-                    {
-                        fileDate = parsed;
-                    }
+                    fileDate = parsed;
                 }
                 
                 var fileInfo = new FileInfo(filePath);
@@ -278,7 +282,7 @@ namespace Log2Postgres.Core.Services
                     };
                 }
                 
-                await SavePositionsAsync();
+                await SavePositionsAsync(cancellationToken);
             }
             catch (Exception ex)
             {
@@ -293,7 +297,9 @@ namespace Log2Postgres.Core.Services
         /// <summary>
         /// Gets a list of all tracked file positions
         /// </summary>
-        public async Task<IReadOnlyList<FilePosition>> GetAllPositionsAsync()
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <returns>List of all tracked file positions</returns>
+        public async Task<IReadOnlyList<FilePosition>> GetAllPositionsAsync(CancellationToken cancellationToken = default)
         {
             // First check if positions file exists, if not recreate it
             if (!PositionsFileExists())
@@ -302,9 +308,10 @@ namespace Log2Postgres.Core.Services
                 await EnsurePositionsFileExistsAsync();
             }
             
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(cancellationToken);
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 return _positions.Values.ToList().AsReadOnly();
             }
             finally
@@ -316,7 +323,10 @@ namespace Log2Postgres.Core.Services
         /// <summary>
         /// Removes tracking for a file
         /// </summary>
-        public async Task RemoveFileAsync(string filePath)
+        /// <param name="filePath">Full path to the file</param>
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <returns>Task representing the async operation</returns>
+        public async Task RemoveFileAsync(string filePath, CancellationToken cancellationToken = default)
         {
             // First check if positions file exists, if not recreate it
             if (!PositionsFileExists())
@@ -325,9 +335,10 @@ namespace Log2Postgres.Core.Services
                 await EnsurePositionsFileExistsAsync();
             }
             
-            await _lock.WaitAsync();
+            await _lock.WaitAsync(cancellationToken);
             try
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 string key = GetNormalizedPath(filePath);
                 if (_positions.Remove(key))
                 {
@@ -348,20 +359,65 @@ namespace Log2Postgres.Core.Services
         /// <summary>
         /// Save positions to the JSON file
         /// </summary>
-        private async Task SavePositionsAsync()
+        /// <param name="cancellationToken">Cancellation token</param>
+        /// <returns>Task representing the async operation</returns>
+        private async Task SavePositionsAsync(CancellationToken cancellationToken = default)
         {
+            string tempFilePath = string.Empty;
             try
             {
-                string json = JsonSerializer.Serialize(_positions.Values.ToList(), 
-                    new JsonSerializerOptions { WriteIndented = true });
-                await File.WriteAllTextAsync(_positionsFilePath, json);
-                _logger.LogDebug("Saved {Count} file positions to {FilePath}", 
-                    _positions.Count, _positionsFilePath);
+                cancellationToken.ThrowIfCancellationRequested();
+                var positionsList = _positions.Values.ToList();
+                var options = new JsonSerializerOptions { WriteIndented = true };
+                string json = JsonSerializer.Serialize(positionsList, options);
+
+                // Create a temporary file path
+                tempFilePath = _positionsFilePath + ".tmp";
+
+                // Write to the temporary file
+                await File.WriteAllTextAsync(tempFilePath, json, cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested(); // Check after async operation
+
+                // Replace the original file with the temporary file
+                File.Move(tempFilePath, _positionsFilePath, overwrite: true);
+                
+                _logger.LogDebug("Saved {Count} positions to {FilePath}", positionsList.Count, _positionsFilePath);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("SavePositionsAsync was cancelled.");
+                // Clean up the temporary file if cancellation occurred
+                if (!string.IsNullOrEmpty(tempFilePath) && File.Exists(tempFilePath))
+                {
+                    try
+                    {
+                        File.Delete(tempFilePath);
+                    }
+                    catch (Exception exDelete)
+                    {
+                        _logger.LogWarning(exDelete, "Failed to delete temporary positions file {TempFilePath} during cancellation.", tempFilePath);
+                    }
+                }
+                throw; // Re-throw the cancellation exception
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error saving positions to {FilePath}: {Message}", 
-                    _positionsFilePath, ex.Message);
+                _logger.LogError(ex, "Error saving positions to {FilePath}: {Message}", _positionsFilePath, ex.Message);
+                // Clean up the temporary file if an error occurred
+                if (!string.IsNullOrEmpty(tempFilePath) && File.Exists(tempFilePath))
+                {
+                    try
+                    {
+                        File.Delete(tempFilePath);
+                    }
+                    catch (Exception exDelete)
+                    {
+                        _logger.LogWarning(exDelete, "Failed to delete temporary positions file {TempFilePath} after error.", tempFilePath);
+                    }
+                }
+                // Optionally, re-throw or handle more gracefully depending on requirements
+                // For now, just logging as the impact might be that positions aren't saved,
+                // but the app might continue running with in-memory positions.
             }
         }
         
@@ -370,7 +426,7 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         private string GetNormalizedPath(string path)
         {
-            return Path.GetFullPath(path).ToLowerInvariant();
+            return Path.GetFullPath(path).ToUpperInvariant();
         }
     }
 } 

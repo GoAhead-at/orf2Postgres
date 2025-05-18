@@ -21,10 +21,10 @@ The log file is **rotated daily**, using the current date in its filename (e.g.,
 - **Integrated Service:** The core file processing logic resides in a .NET Worker Service, designed to run either as a Windows Service or within the UI process.
 - **WPF UI:** The User Interface uses Windows Presentation Foundation (WPF) for configuration and monitoring.
 - **Communication (IPC):** The UI and service communicate using Named Pipes:
-    - The service hosts a Named Pipe Server
-    - The UI connects as a Named Pipe Client
-    - Commands and status updates are transmitted as JSON messages
-    - The UI can operate in standalone mode when no service is detected
+    - The service (typically running as `NetworkService`) hosts a Named Pipe Server.
+    - The UI (running as a standard user) connects as a Named Pipe Client.
+    - Access control for the pipe is crucial; the pipe is created using `System.IO.Pipes.NamedPipeServerStreamAcl.Create()` with a `PipeSecurity` object that grants `Authenticated Users` (including the standard user running the UI) necessary permissions (`ReadWrite` and `CreateNewInstance`) to connect to the service pipe. This ensures communication even when the UI is run by a non-administrator.
+    - Commands and status updates are transmitted as JSON messages.
 - **Mode-Independent Optimizations:** The same efficiency optimizations for offset tracking, duplicate prevention, and database operations apply across all modes:
     - Windows Service mode retains all optimizations when run as a background process
     - UI-embedded mode directly implements the same optimizations 
@@ -184,6 +184,10 @@ The log file is **rotated daily**, using the current date in its filename (e.g.,
 - **Console Application:** For development or headless server environments.
 - **WPF Application:** For interactive use with UI.
 - **In-Window Processing:** When running as a WPF application without the service installed, the UI can spawn its own processing instance.
+- **Service Management & UAC:**
+    - The UI can be run as a standard user.
+    - **Installation/Uninstallation:** When the "Install Service" or "Uninstall Service" buttons are clicked, the application uses `sc.exe` with the `runas` verb. This will trigger a User Account Control (UAC) prompt, requesting administrator privileges for that specific operation only. The main UI application itself does not need to be launched as an administrator for these actions.
+    - **Starting/Stopping Service:** The "Start Service" and "Stop Service" buttons in the UI currently interact with the service using `System.ServiceProcess.ServiceController`. These operations will only succeed if the UI application itself is launched with administrator privileges, as `ServiceController` does not have a built-in UAC elevation prompt mechanism for these actions. If the UI is run as a standard user, these buttons will typically be disabled or result in an error if clicked while targeting an installed service.
 
 ---
 
@@ -229,10 +233,11 @@ The WPF User Interface provides:
     - Reset to Defaults button for resetting configuration
 
 - **Service Control:**
-  - Install/Uninstall buttons for Windows Service management
+  - Install/Uninstall buttons for Windows Service management (triggers UAC prompt if UI is run as standard user).
+  - Start/Stop buttons for Windows Service (requires UI to be run as administrator to succeed) or local processing.
   - Enable/Disable buttons that control processing:
-    - If service is installed: sends commands to the service
-    - If no service is installed: runs processing directly in the application window
+    - If service is installed: sends commands to the service (Start/Stop).
+    - If no service is installed: runs processing directly in the application window (Start/Stop Processing).
 
 - **Status Display:**
   - Current service status (Running, Stopped, Error)
@@ -272,7 +277,7 @@ The WPF User Interface provides:
   - **Logging:** Microsoft.Extensions.Logging with Serilog or NLog as providers
   - **Configuration:** Microsoft.Extensions.Configuration with JSON provider
   - **Service Management:** Microsoft.Extensions.Hosting for Worker Service implementation
-  - **IPC Communication:** H.Pipes or similar library for Named Pipes implementation
+  - **IPC Communication:** H.Pipes or similar library for Named Pipes implementation. The `System.IO.Pipes.AccessControl` NuGet package is used for `NamedPipeServerStreamAcl.Create()`.
   - **UI Components:** Material Design in XAML Toolkit for modern UI elements
   - **Resilience:** Polly for retry policies and circuit breakers
   - **File Watching:** Enhanced FileSystemWatcher implementations or libraries
@@ -292,10 +297,11 @@ The WPF User Interface provides:
   - Graceful degradation when services are unavailable
 
 - **Named Pipes Protocol:**
-  - JSON-based message format with action/response pattern
-  - Bidirectional communication for commands and status updates
-  - Automatic reconnection attempts when service is available
-  - Potential use of a dedicated library for improved reliability
+  - JSON-based message format with action/response pattern.
+  - Bidirectional communication for commands and status updates.
+  - To ensure standard users can communicate with the service (running as `NetworkService`), the pipe server is created using `System.IO.Pipes.NamedPipeServerStreamAcl.Create()`. This method, available via the `System.IO.Pipes.AccessControl` NuGet package (version 5.0.0 or compatible), allows a `PipeSecurity` object to be passed directly during the pipe's construction.
+  - The `PipeSecurity` is configured to grant `PipeAccessRights.ReadWrite` and `PipeAccessRights.CreateNewInstance` to the `Authenticated Users` group (`WellKnownSidType.AuthenticatedUserSid`). This allows the UI, running as a standard user, to connect successfully.
+  - Automatic reconnection attempts when service is available.
 
 - **Multi-Mode Startup:**
   - Command-line arguments determine the application mode:
@@ -354,9 +360,10 @@ The WPF User Interface provides:
   - Consider using TLS for all database communications
   
 - **IPC Security:**
-  - Named pipes restricted to authorized users
-  - Proper access control on pipe endpoints
-  - Message authentication for commands sent between UI and service
+  - Named pipes are secured to allow access for standard user UI processes connecting to the service running under the `NetworkService` account.
+  - This is achieved by creating the `NamedPipeServerStream` using `NamedPipeServerStreamAcl.Create()`. A `PipeSecurity` object is passed during construction, configured to grant `PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance` to `Authenticated Users` (`WellKnownSidType.AuthenticatedUserSid`).
+  - This ensures the UI can connect without requiring administrative privileges, establishing proper access control at the pipe's creation time by the `NetworkService`.
+  - Message authentication for commands sent between UI and service (can be a future enhancement if needed).
   
 - **Startup Parameters:**
   - Remove unnecessary permissions at service startup
