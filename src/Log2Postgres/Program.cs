@@ -1,7 +1,6 @@
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
 using System;
-using System.Diagnostics;
+using System.IO;
+using System.Windows;
 using System.Linq;
 
 namespace Log2Postgres
@@ -11,52 +10,43 @@ namespace Log2Postgres
         [STAThread]
         public static void Main(string[] args)
         {
-            // Determine if we should run as a window or service
-            var shouldRunAsWindow = ShouldRunAsWindow(args);
-
-            if (shouldRunAsWindow)
+            try
             {
-                // Run as WPF application
-                var application = new App();
-                application.InitializeComponent();
-                application.Run();
+                // Initialize position file if it doesn't exist
+                string positionsFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "positions.json");
+                if (!File.Exists(positionsFilePath))
+                {
+                    // Create a minimal valid JSON array for positions
+                    File.WriteAllText(positionsFilePath, "[]");
+                    Console.WriteLine($"Created new positions file at {positionsFilePath}");
+                }
+                
+                // Normal application start using the WPF application class
+                var app = new App();
+                app.InitializeComponent(); // Ensure App.xaml resources are loaded
+                app.Run();
             }
-            else
+            catch (Exception ex)
             {
-                // Run as a service or console app
-                CreateHostBuilder(args).Build().Run();
+                // Log the error
+                File.WriteAllText(
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "startup_crash.txt"),
+                    $"Application crashed at startup: {ex.Message}\n\nStack trace:\n{ex.StackTrace}");
+                
+                // Show an error message if possible
+                try
+                {
+                    System.Windows.MessageBox.Show(
+                        $"Fatal error: {ex.Message}\n\nCheck startup_crash.txt for details.",
+                        "Startup Crash",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Error);
+                }
+                catch
+                {
+                    // If showing a message box fails, at least we have the log file
+                }
             }
-        }
-
-        public static IHostBuilder CreateHostBuilder(string[] args) =>
-            Host.CreateDefaultBuilder(args)
-                .UseWindowsService(options =>
-                {
-                    options.ServiceName = "Log2Postgres";
-                })
-                .ConfigureServices((hostContext, services) =>
-                {
-                    // We'll configure services here for service/console mode
-                });
-
-        private static bool ShouldRunAsWindow(string[] args)
-        {
-            // Check if running as a Windows service
-            if (args.Contains("--service", StringComparer.OrdinalIgnoreCase))
-                return false;
-
-            // Check if running as a console app
-            if (args.Contains("--console", StringComparer.OrdinalIgnoreCase))
-                return false;
-
-            // When no specific arguments and not running as a service, default to window mode
-            return !IsRunningAsService();
-        }
-
-        private static bool IsRunningAsService()
-        {
-            using var process = Process.GetCurrentProcess();
-            return process.ProcessName.Contains("services", StringComparison.OrdinalIgnoreCase);
         }
     }
 } 

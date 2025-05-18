@@ -103,9 +103,6 @@
                                 
                                 <TextBlock Text="Polling Interval (seconds):" Margin="0,5,0,2"/>
                                 <TextBox x:Name="PollingInterval" Text="5" Margin="0,0,0,10"/>
-                                
-                                <Button x:Name="ValidatePathBtn" Content="Validate Path" Style="{StaticResource MaterialDesignOutlinedButton}" 
-                                        Margin="0,5,0,5" Click="ValidatePathBtn_Click"/>
                             </StackPanel>
                         </Expander>
                         
@@ -193,12 +190,48 @@
                             
                             <!-- Log Filter Controls -->
                             <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,5">
-                                <ToggleButton x:Name="ShowStatusToggle" Content="Status" IsChecked="True" Style="{StaticResource MaterialDesignOutlinedButton}" 
-                                              Margin="0,0,5,0" Click="LogFilterToggle_Click"/>
-                                <ToggleButton x:Name="ShowWarningsToggle" Content="Warnings" IsChecked="True" Style="{StaticResource MaterialDesignOutlinedButton}" 
-                                              Margin="0,0,5,0" Click="LogFilterToggle_Click"/>
-                                <ToggleButton x:Name="ShowErrorsToggle" Content="Errors" IsChecked="True" Style="{StaticResource MaterialDesignOutlinedButton}" 
-                                              Margin="0,0,5,0" Click="LogFilterToggle_Click"/>
+                                <ToggleButton x:Name="ShowStatusToggle" Content="Status" IsChecked="True" 
+                                              Margin="0,0,5,0" Click="LogFilterToggle_Click">
+                                    <ToggleButton.Style>
+                                        <Style TargetType="ToggleButton" BasedOn="{StaticResource MaterialDesignOutlinedButton}">
+                                            <Setter Property="Background" Value="Transparent"/>
+                                            <Style.Triggers>
+                                                <Trigger Property="IsChecked" Value="True">
+                                                    <Setter Property="Background" Value="#90EE90"/>
+                                                    <Setter Property="BorderBrush" Value="#006400"/>
+                                                </Trigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </ToggleButton.Style>
+                                </ToggleButton>
+                                <ToggleButton x:Name="ShowWarningsToggle" Content="Warnings" IsChecked="True" 
+                                              Margin="0,0,5,0" Click="LogFilterToggle_Click">
+                                    <ToggleButton.Style>
+                                        <Style TargetType="ToggleButton" BasedOn="{StaticResource MaterialDesignOutlinedButton}">
+                                            <Setter Property="Background" Value="Transparent"/>
+                                            <Style.Triggers>
+                                                <Trigger Property="IsChecked" Value="True">
+                                                    <Setter Property="Background" Value="#90EE90"/>
+                                                    <Setter Property="BorderBrush" Value="#006400"/>
+                                                </Trigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </ToggleButton.Style>
+                                </ToggleButton>
+                                <ToggleButton x:Name="ShowErrorsToggle" Content="Errors" IsChecked="True" 
+                                              Margin="0,0,5,0" Click="LogFilterToggle_Click">
+                                    <ToggleButton.Style>
+                                        <Style TargetType="ToggleButton" BasedOn="{StaticResource MaterialDesignOutlinedButton}">
+                                            <Setter Property="Background" Value="Transparent"/>
+                                            <Style.Triggers>
+                                                <Trigger Property="IsChecked" Value="True">
+                                                    <Setter Property="Background" Value="#90EE90"/>
+                                                    <Setter Property="BorderBrush" Value="#006400"/>
+                                                </Trigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </ToggleButton.Style>
+                                </ToggleButton>
                                 <Button x:Name="ClearLogsBtn" Content="Clear Logs" Style="{StaticResource MaterialDesignOutlinedButton}" 
                                         Margin="10,0,0,0" Click="ClearLogsBtn_Click"/>
                             </StackPanel>
@@ -230,8 +263,6 @@
                                     </TextBlock>
                                 </StackPanel>
                             </Grid>
-                            <Button x:Name="ViewSampleDataBtn" Content="View Sample Data" Style="{StaticResource MaterialDesignOutlinedButton}" 
-                                    Margin="0,5,0,0" Click="ViewSampleDataBtn_Click"/>
                         </StackPanel>
                     </GroupBox>
                 </Grid>

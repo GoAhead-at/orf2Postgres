@@ -7,6 +7,7 @@ using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Reflection;
 
 namespace Log2Postgres.Core.Services
 {
@@ -20,21 +21,19 @@ namespace Log2Postgres.Core.Services
         private Dictionary<string, FilePosition> _positions = new();
         private readonly SemaphoreSlim _lock = new(1, 1);
         
+        // Event to notify when positions are loaded or reset
+        public event Action<bool>? PositionsLoaded;
+        
         public PositionManager(ILogger<PositionManager> logger)
         {
             _logger = logger;
             
-            string appDataPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Log2Postgres");
-                
-            // Ensure directory exists
-            if (!Directory.Exists(appDataPath))
-            {
-                Directory.CreateDirectory(appDataPath);
-            }
+            // Store positions.json in the application directory
+            string appDirectory = AppContext.BaseDirectory;
             
-            _positionsFilePath = Path.Combine(appDataPath, "positions.json");
+            _positionsFilePath = Path.Combine(appDirectory, "positions.json");
+            _logger.LogInformation("Using positions file: {PositionsFile}", _positionsFilePath);
+            
             LoadPositions();
         }
         
@@ -45,6 +44,13 @@ namespace Log2Postgres.Core.Services
         /// <returns>Last known position (0 if not previously tracked)</returns>
         public async Task<long> GetPositionAsync(string filePath)
         {
+            // First check if positions file exists, if not recreate it
+            if (!PositionsFileExists())
+            {
+                _logger.LogWarning("Positions file does not exist when getting position. Creating a new one.");
+                await EnsurePositionsFileExistsAsync();
+            }
+            
             await _lock.WaitAsync();
             try
             {
@@ -62,6 +68,164 @@ namespace Log2Postgres.Core.Services
         }
         
         /// <summary>
+        /// Checks if the positions file exists
+        /// </summary>
+        /// <returns>True if the positions file exists, false otherwise</returns>
+        public bool PositionsFileExists()
+        {
+            return File.Exists(_positionsFilePath);
+        }
+        
+        /// <summary>
+        /// Ensures the positions file exists, creating it with default values if it doesn't
+        /// </summary>
+        /// <returns>Task representing the async operation</returns>
+        private async Task EnsurePositionsFileExistsAsync()
+        {
+            await _lock.WaitAsync();
+            try
+            {
+                if (!File.Exists(_positionsFilePath))
+                {
+                    _logger.LogInformation("Positions file does not exist. Creating a new one with default values.");
+                    
+                    // Reset positions dictionary to empty
+                    _positions = new Dictionary<string, FilePosition>();
+                    
+                    // Save the empty positions file
+                    await SavePositionsAsync();
+                    
+                    // Notify that positions were reset
+                    PositionsLoaded?.Invoke(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error ensuring positions file exists: {Message}", ex.Message);
+            }
+            finally
+            {
+                _lock.Release();
+            }
+        }
+        
+        /// <summary>
+        /// Reset and reload positions from the JSON file
+        /// </summary>
+        /// <returns>True if positions were loaded, false if reset to empty</returns>
+        public bool LoadPositions()
+        {
+            bool positionsLoaded = false;
+            try
+            {
+                // Make sure there is a lock when loading positions
+                _lock.Wait();
+                
+                try
+                {
+                    _logger.LogDebug("Loading positions from {FilePath}", _positionsFilePath);
+                    
+                    if (File.Exists(_positionsFilePath))
+                    {
+                        try
+                        {
+                            string json = File.ReadAllText(_positionsFilePath);
+                            
+                            // Make sure the JSON is valid
+                            if (string.IsNullOrWhiteSpace(json))
+                            {
+                                _logger.LogWarning("Positions file exists but is empty. Creating a new empty positions dictionary.");
+                                _positions = new Dictionary<string, FilePosition>();
+                            }
+                            else
+                            {
+                                try
+                                {
+                                    var positions = JsonSerializer.Deserialize<List<FilePosition>>(json);
+                                    if (positions != null && positions.Count > 0)
+                                    {
+                                        _positions = positions.ToDictionary(p => GetNormalizedPath(p.FilePath));
+                                        _logger.LogInformation("Loaded {Count} file positions from {FilePath}", 
+                                            _positions.Count, _positionsFilePath);
+                                        positionsLoaded = true;
+                                    }
+                                    else
+                                    {
+                                        _logger.LogInformation("Positions file exists but is empty or invalid");
+                                        _positions = new Dictionary<string, FilePosition>();
+                                    }
+                                }
+                                catch (JsonException jsonEx)
+                                {
+                                    _logger.LogError(jsonEx, "Error deserializing positions file: {Message}. Creating a backup and starting with a new file.", 
+                                        jsonEx.Message);
+                                        
+                                    // Backup the corrupted file
+                                    string backupPath = _positionsFilePath + ".bak." + DateTime.Now.ToString("yyyyMMddHHmmss");
+                                    try
+                                    {
+                                        File.Copy(_positionsFilePath, backupPath);
+                                        _logger.LogInformation("Created backup of corrupted positions file at {BackupPath}", backupPath);
+                                    }
+                                    catch (Exception backupEx)
+                                    {
+                                        _logger.LogWarning(backupEx, "Failed to create backup of corrupted positions file: {Message}", backupEx.Message);
+                                    }
+                                    
+                                    // Start with a new empty dictionary
+                                    _positions = new Dictionary<string, FilePosition>();
+                                }
+                            }
+                        }
+                        catch (IOException ioEx)
+                        {
+                            _logger.LogError(ioEx, "IO error reading positions file: {Message}. Will use empty positions.", ioEx.Message);
+                            _positions = new Dictionary<string, FilePosition>();
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogInformation("Positions file does not exist, using empty positions");
+                        _positions = new Dictionary<string, FilePosition>();
+                        
+                        // Create the positions file with default values
+                        try
+                        {
+                            SavePositionsAsync().Wait();
+                            _logger.LogInformation("Created new positions file at {FilePath}", _positionsFilePath);
+                        }
+                        catch (Exception saveEx)
+                        {
+                            _logger.LogError(saveEx, "Failed to create new positions file: {Message}", saveEx.Message);
+                        }
+                    }
+                }
+                finally
+                {
+                    _lock.Release();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unhandled error loading positions from {FilePath}: {Message}", 
+                    _positionsFilePath, ex.Message);
+                _positions = new Dictionary<string, FilePosition>();
+            }
+            
+            // Notify subscribers
+            try
+            {
+                PositionsLoaded?.Invoke(positionsLoaded);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error in PositionsLoaded event handler: {Message}", ex.Message);
+            }
+            
+            return positionsLoaded;
+        }
+        
+        /// <summary>
         /// Updates the position for a file
         /// </summary>
         /// <param name="filePath">Full path to the file</param>
@@ -69,6 +233,13 @@ namespace Log2Postgres.Core.Services
         /// <returns>Task representing the async operation</returns>
         public async Task UpdatePositionAsync(string filePath, long position)
         {
+            // First check if positions file exists, if not recreate it
+            if (!PositionsFileExists())
+            {
+                _logger.LogWarning("Positions file does not exist when updating position. Creating a new one.");
+                await EnsurePositionsFileExistsAsync();
+            }
+            
             await _lock.WaitAsync();
             try
             {
@@ -124,6 +295,13 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         public async Task<IReadOnlyList<FilePosition>> GetAllPositionsAsync()
         {
+            // First check if positions file exists, if not recreate it
+            if (!PositionsFileExists())
+            {
+                _logger.LogWarning("Positions file does not exist when getting all positions. Creating a new one.");
+                await EnsurePositionsFileExistsAsync();
+            }
+            
             await _lock.WaitAsync();
             try
             {
@@ -140,6 +318,13 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         public async Task RemoveFileAsync(string filePath)
         {
+            // First check if positions file exists, if not recreate it
+            if (!PositionsFileExists())
+            {
+                _logger.LogWarning("Positions file does not exist when removing file. Creating a new one.");
+                await EnsurePositionsFileExistsAsync();
+            }
+            
             await _lock.WaitAsync();
             try
             {
@@ -157,33 +342,6 @@ namespace Log2Postgres.Core.Services
             finally
             {
                 _lock.Release();
-            }
-        }
-        
-        /// <summary>
-        /// Load positions from the JSON file
-        /// </summary>
-        private void LoadPositions()
-        {
-            try
-            {
-                if (File.Exists(_positionsFilePath))
-                {
-                    string json = File.ReadAllText(_positionsFilePath);
-                    var positions = JsonSerializer.Deserialize<List<FilePosition>>(json);
-                    if (positions != null)
-                    {
-                        _positions = positions.ToDictionary(p => GetNormalizedPath(p.FilePath));
-                        _logger.LogInformation("Loaded {Count} file positions from {FilePath}", 
-                            _positions.Count, _positionsFilePath);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error loading positions from {FilePath}: {Message}", 
-                    _positionsFilePath, ex.Message);
-                _positions = new Dictionary<string, FilePosition>();
             }
         }
         

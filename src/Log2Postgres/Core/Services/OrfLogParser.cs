@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Text;
+using System.Linq;
 
 namespace Log2Postgres.Core.Services
 {
@@ -132,90 +133,132 @@ namespace Log2Postgres.Core.Services
             
             try
             {
-                string[] parts = line.Split('\t');
+                // Split by spaces, but handle the fields properly
+                string[] parts = line.Split(' ');
+                _logger.LogTrace("Parsed log line into {Count} parts", parts.Length);
                 
-                // Handle the special case for system messages
-                if (parts[0] == "0-0")
+                // Handle the special case for system messages (0-0)
+                if (parts.Length > 0 && parts[0] == "0-0")
                 {
-                    // System message format is different
+                    // System message format is different (0-0 - dateTime System Info - ...)
                     entry.MessageId = parts[0];
                     entry.EventSource = parts[1]; // Usually "-"
                     
-                    // Parse datetime from a system message
-                    if (DateTime.TryParseExact(parts[2], "yyyy-MM-dd'T'HH:mm:ss", 
+                    // Parse datetime from a system message (third component)
+                    if (parts.Length > 2 && DateTime.TryParseExact(parts[2], "yyyy-MM-dd'T'HH:mm:ss", 
                             CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime dt))
                     {
                         entry.EventDateTime = dt;
                     }
                     
-                    entry.EventClass = parts[3]; // Usually "System"
-                    entry.EventSeverity = parts[4]; // Usually "Info"
-                    entry.EventMsg = parts[15]; // The actual message is in the event_msg field
+                    if (parts.Length > 3) entry.EventClass = parts[3]; // Usually "System"
+                    if (parts.Length > 4) entry.EventSeverity = parts[4]; // Usually "Info"
+                    
+                    // The event message is typically at the end after several dashes
+                    // Find the message by looking for the pattern of dashes and then taking the rest
+                    int msgIndex = -1;
+                    for (int i = 5; i < parts.Length - 1; i++)
+                    {
+                        if (parts[i] == "-" && parts[i+1] == "-")
+                        {
+                            msgIndex = i + 2;
+                            break;
+                        }
+                    }
+                    
+                    if (msgIndex > 0 && msgIndex < parts.Length)
+                    {
+                        entry.EventMsg = string.Join(" ", parts.Skip(msgIndex));
+                    }
                     
                     return entry;
                 }
                 
-                // Standard message format - map fields based on the field order
-                for (int i = 0; i < Math.Min(parts.Length, _fieldOrder.Count); i++)
+                // Map fields based on the field order from the header
+                // We need to handle this carefully since some fields may contain spaces
+                if (parts.Length >= _fieldOrder.Count)
                 {
-                    string fieldName = _fieldOrder[i];
-                    string value = parts[i];
+                    // Extract fields according to the structure defined in the header
+                    int currentIndex = 0;
                     
-                    switch (fieldName)
+                    for (int i = 0; i < _fieldOrder.Count; i++)
                     {
-                        case "x-message-id":
-                            entry.MessageId = value;
-                            break;
-                        case "x-event-source":
-                            entry.EventSource = value;
-                            break;
-                        case "x-event-datetime":
-                            if (DateTime.TryParseExact(value, "yyyy-MM-dd'T'HH:mm:ss", 
-                                CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime dt))
-                            {
-                                entry.EventDateTime = dt;
-                            }
-                            break;
-                        case "x-event-class":
-                            entry.EventClass = value;
-                            break;
-                        case "x-event-severity":
-                            entry.EventSeverity = value;
-                            break;
-                        case "x-event-action":
-                            entry.EventAction = value;
-                            break;
-                        case "x-filtering-point":
-                            entry.FilteringPoint = value;
-                            break;
-                        case "x-ip":
-                            entry.IP = value;
-                            break;
-                        case "x-sender":
-                            entry.Sender = value;
-                            break;
-                        case "x-recipients":
-                            entry.Recipients = value;
-                            break;
-                        case "x-msg-subject":
-                            entry.MsgSubject = value;
-                            break;
-                        case "x-msg-author":
-                            entry.MsgAuthor = value;
-                            break;
-                        case "x-remote-peer":
-                            entry.RemotePeer = value;
-                            break;
-                        case "x-source-ip":
-                            entry.SourceIP = value;
-                            break;
-                        case "x-country":
-                            entry.Country = value;
-                            break;
-                        case "x-event-msg":
-                            entry.EventMsg = value;
-                            break;
+                        string fieldName = _fieldOrder[i];
+                        string value;
+                        
+                        // For the last field, take all remaining parts
+                        if (i == _fieldOrder.Count - 1)
+                        {
+                            value = string.Join(" ", parts.Skip(currentIndex));
+                        }
+                        else
+                        {
+                            value = parts[currentIndex];
+                            currentIndex++;
+                        }
+                        
+                        // Process each field
+                        switch (fieldName)
+                        {
+                            case "x-message-id":
+                                entry.MessageId = value;
+                                break;
+                            case "x-event-source":
+                                entry.EventSource = value;
+                                break;
+                            case "x-event-datetime":
+                                if (DateTime.TryParseExact(value, "yyyy-MM-dd'T'HH:mm:ss", 
+                                    CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime dt))
+                                {
+                                    entry.EventDateTime = dt;
+                                }
+                                break;
+                            case "x-event-class":
+                                entry.EventClass = value;
+                                break;
+                            case "x-event-severity":
+                                entry.EventSeverity = value;
+                                break;
+                            case "x-event-action":
+                                entry.EventAction = value;
+                                break;
+                            case "x-filtering-point":
+                                entry.FilteringPoint = value;
+                                break;
+                            case "x-ip":
+                                entry.IP = value;
+                                break;
+                            case "x-sender":
+                                entry.Sender = value;
+                                break;
+                            case "x-recipients":
+                                entry.Recipients = value;
+                                break;
+                            case "x-msg-subject":
+                                entry.MsgSubject = value;
+                                break;
+                            case "x-msg-author":
+                                entry.MsgAuthor = value;
+                                break;
+                            case "x-remote-peer":
+                                entry.RemotePeer = value;
+                                break;
+                            case "x-source-ip":
+                                entry.SourceIP = value;
+                                break;
+                            case "x-country":
+                                entry.Country = value;
+                                break;
+                            case "x-event-msg":
+                                entry.EventMsg = value;
+                                break;
+                        }
                     }
+                }
+                else
+                {
+                    _logger.LogWarning("Log entry has fewer parts ({PartsCount}) than expected fields ({FieldCount}): {Line}", 
+                        parts.Length, _fieldOrder.Count, line);
                 }
                 
                 return entry;
