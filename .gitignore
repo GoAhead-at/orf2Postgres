@@ -77,3 +77,9 @@ _ReSharper*/
 logs/
 *.sqlite
 *.db 
+
+# IDE / Editor specific folders
+.cursor/
+.idea/
+
+# Ignore .gitignore itself 
