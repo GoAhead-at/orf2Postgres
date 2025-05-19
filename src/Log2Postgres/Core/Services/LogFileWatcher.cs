@@ -143,7 +143,7 @@ namespace Log2Postgres.Core.Services
         {
             _logger.LogDebug("Performing initial setup...");
             _lastProcessingError = null;
-            await SetupFileSystemWatcherAsync();
+            SetupFileSystemWatcherAsync();
 
             // Optional: Check database connection/table during service startup
             try
@@ -168,7 +168,7 @@ namespace Log2Postgres.Core.Services
         /// <summary>
         /// Setup the file system watcher with the current directory settings
         /// </summary>
-        private async Task SetupFileSystemWatcherAsync()
+        private void SetupFileSystemWatcherAsync()
         {
             if (string.IsNullOrWhiteSpace(_settings.BaseDirectory))
             {
@@ -628,7 +628,7 @@ namespace Log2Postgres.Core.Services
             _logger.LogInformation("IPC Server starting. Pipe name: {PipeName}", PipeName);
             while (!cancellationToken.IsCancellationRequested)
             {
-                NamedPipeServerStream pipeServer = null;
+                NamedPipeServerStream? pipeServer = null;
                 try
                 {
                     _logger.LogDebug("IPC Server: Preparing PipeSecurity for Authenticated Users.");
@@ -863,7 +863,7 @@ namespace Log2Postgres.Core.Services
             if (directoryChanged) // Re-setup watcher if directory changed
             {
                 _logger.LogDebug("Directory changed, re-evaluating FileSystemWatcher.");
-                await SetupFileSystemWatcherAsync();
+                SetupFileSystemWatcherAsync();
             }
             
             // Logic to handle starting or stopping processing based on directory validity
@@ -878,7 +878,7 @@ namespace Log2Postgres.Core.Services
                         _logger.LogInformation("Valid log directory '{NewDir}' configured and processing was not active. Attempting to start processing.", _settings.BaseDirectory);
                         IsProcessing = true; // Set processing to active
                         _lastProcessingError = null; // Clear any previous config error
-                        ErrorOccurred?.Invoke("Configuration", null); // Notify UI that error is cleared
+                        ErrorOccurred?.Invoke("Configuration", string.Empty); // CS8625 fix: Pass string.Empty instead of null
 
                         // Now process existing files and allow polling loop to take over
                         await InitializeAndProcessFilesOnStartAsync(_stoppingCts.Token);
@@ -1021,7 +1021,7 @@ namespace Log2Postgres.Core.Services
                 string[] matchingFiles = GetMatchingLogFiles();
                 if (matchingFiles.Length > 0)
                 {
-                    string mostRecentFile = matchingFiles
+                    string? mostRecentFile = matchingFiles
                         .OrderByDescending(f => new FileInfo(f).LastWriteTime)
                         .FirstOrDefault();
                         

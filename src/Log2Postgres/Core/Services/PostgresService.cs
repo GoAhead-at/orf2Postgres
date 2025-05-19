@@ -16,7 +16,7 @@ namespace Log2Postgres.Core.Services
     {
         private readonly ILogger<PostgresService> _logger;
         private readonly DatabaseSettings _settings;
-        private string _connectionString;
+        private string _connectionString = null!;
 
         public PostgresService(ILogger<PostgresService> logger, IOptions<DatabaseSettings> settings)
         {
@@ -156,7 +156,7 @@ namespace Log2Postgres.Core.Services
             cmd.Parameters.AddWithValue("schema", _settings.Schema);
             cmd.Parameters.AddWithValue("table", _settings.Table);
             
-            return (bool)await cmd.ExecuteScalarAsync();
+            return (bool?)await cmd.ExecuteScalarAsync() ?? false;
         }
 
         /// <summary>
@@ -294,11 +294,11 @@ namespace Log2Postgres.Core.Services
                 // Verify all expected columns exist with correct type
                 foreach (var expected in expectedColumns)
                 {
-                    if (!actualColumns.TryGetValue(expected.Key, out string actualType) || 
+                    if (!actualColumns.TryGetValue(expected.Key, out string? actualType) ||
                         !actualType.Equals(expected.Value, StringComparison.OrdinalIgnoreCase))
                     {
                         _logger.LogWarning("Column mismatch: Expected {ColumnName} as {ExpectedType}, got {ActualType}",
-                            expected.Key, expected.Value, actualColumns.TryGetValue(expected.Key, out string type) ? type : "missing");
+                            expected.Key, expected.Value, actualColumns.TryGetValue(expected.Key, out string? type) ? type : "missing");
                         return false;
                     }
                 }
@@ -539,17 +539,18 @@ namespace Log2Postgres.Core.Services
         public async Task<List<OrfLogEntry>> GetSampleDataAsync(int limit = 100)
         {
             var entries = new List<OrfLogEntry>();
-            
             try
             {
+                _logger.LogDebug("Fetching up to {Limit} sample log entries from {Schema}.{Table}", limit, _settings.Schema, _settings.Table);
                 using var connection = new NpgsqlConnection(_connectionString);
                 await connection.OpenAsync();
                 
                 string sql = $@"
-                    SELECT message_id, event_source, event_datetime, event_class, 
-                           event_severity, event_action, filtering_point, ip, 
-                           sender, recipients, msg_subject, msg_author, 
-                           remote_peer, source_ip, country, event_msg, filename, processed_at
+                    SELECT 
+                        message_id, event_source, event_datetime, event_class, event_severity, 
+                        event_action, filtering_point, ip, sender, recipients, 
+                        msg_subject, msg_author, remote_peer, source_ip, country, 
+                        event_msg, filename, processed_at
                     FROM {_settings.Schema}.{_settings.Table}
                     ORDER BY event_datetime DESC
                     LIMIT @limit;";
@@ -562,37 +563,34 @@ namespace Log2Postgres.Core.Services
                 {
                     var entry = new OrfLogEntry
                     {
-                        MessageId = reader["message_id"].ToString(),
-                        EventSource = reader["event_source"].ToString(),
-                        EventDateTime = reader.GetDateTime(reader.GetOrdinal("event_datetime")),
-                        EventClass = reader["event_class"].ToString(),
-                        EventSeverity = reader["event_severity"].ToString(),
-                        EventAction = reader["event_action"].ToString(),
-                        FilteringPoint = reader["filtering_point"].ToString(),
-                        IP = reader["ip"].ToString(),
-                        Sender = reader["sender"].ToString(),
-                        Recipients = reader["recipients"].ToString(),
-                        MsgSubject = reader["msg_subject"].ToString(),
-                        MsgAuthor = reader["msg_author"].ToString(),
-                        RemotePeer = reader["remote_peer"].ToString(),
-                        SourceIP = reader["source_ip"].ToString(),
-                        Country = reader["country"].ToString(),
-                        EventMsg = reader["event_msg"].ToString(),
-                        SourceFilename = reader["filename"].ToString(),
-                        ProcessedAt = reader.GetDateTime(reader.GetOrdinal("processed_at"))
+                        MessageId = reader.IsDBNull(0) ? string.Empty : (reader.GetString(0) ?? string.Empty),
+                        EventSource = reader.IsDBNull(1) ? string.Empty : (reader.GetString(1) ?? string.Empty),
+                        EventDateTime = reader.IsDBNull(2) ? DateTime.MinValue : reader.GetDateTime(2),
+                        EventClass = reader.IsDBNull(3) ? string.Empty : (reader.GetString(3) ?? string.Empty),
+                        EventSeverity = reader.IsDBNull(4) ? string.Empty : (reader.GetString(4) ?? string.Empty),
+                        EventAction = reader.IsDBNull(5) ? string.Empty : (reader.GetString(5) ?? string.Empty),
+                        FilteringPoint = reader.IsDBNull(6) ? string.Empty : (reader.GetString(6) ?? string.Empty),
+                        IP = reader.IsDBNull(7) ? string.Empty : (reader.GetString(7) ?? string.Empty),
+                        Sender = reader.IsDBNull(8) ? string.Empty : (reader.GetString(8) ?? string.Empty),
+                        Recipients = reader.IsDBNull(9) ? string.Empty : (reader.GetString(9) ?? string.Empty),
+                        MsgSubject = reader.IsDBNull(10) ? string.Empty : (reader.GetString(10) ?? string.Empty),
+                        MsgAuthor = reader.IsDBNull(11) ? string.Empty : (reader.GetString(11) ?? string.Empty),
+                        RemotePeer = reader.IsDBNull(12) ? string.Empty : (reader.GetString(12) ?? string.Empty),
+                        SourceIP = reader.IsDBNull(13) ? string.Empty : (reader.GetString(13) ?? string.Empty),
+                        Country = reader.IsDBNull(14) ? string.Empty : (reader.GetString(14) ?? string.Empty),
+                        EventMsg = reader.IsDBNull(15) ? string.Empty : (reader.GetString(15) ?? string.Empty),
+                        SourceFilename = reader.IsDBNull(16) ? string.Empty : (reader.GetString(16) ?? string.Empty),
+                        ProcessedAt = reader.IsDBNull(17) ? DateTime.MinValue : reader.GetDateTime(17)
                     };
-                    
                     entries.Add(entry);
                 }
-                
-                _logger.LogInformation("Retrieved {Count} sample rows from database", entries.Count);
-                return entries;
+                _logger.LogDebug("Fetched {Count} sample entries", entries.Count);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error getting sample data: {Message}", ex.Message);
-                return entries;
             }
+            return entries;
         }
     }
 

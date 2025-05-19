@@ -32,21 +32,27 @@ namespace Log2Postgres;
 public partial class MainWindow : Window
 {
     private const string PipeName = "Log2PostgresServicePipe";
-    private DispatcherTimer _serviceStatusTimer;
-    private bool _isServiceUiUpdatePending = false;
+    private DispatcherTimer _serviceStatusTimer = null!;
 
     private const int MaxUiLogLines = 500; // Added constant for max log lines
 
-    private readonly IConfiguration _configuration;
-    private readonly PostgresService _postgresService;
-    private readonly LogFileWatcher _logFileWatcher;
-    private readonly ILogger<MainWindow> _logger;
-    private readonly PasswordEncryption _passwordEncryption;
-    private readonly PositionManager _positionManager;
+    private readonly IConfiguration _configuration = null!;
+    private readonly PostgresService _postgresService = null!;
+    private readonly LogFileWatcher _logFileWatcher = null!;
+    private readonly ILogger<MainWindow> _logger = null!;
+    private readonly PasswordEncryption _passwordEncryption = null!;
+    private readonly PositionManager _positionManager = null!;
     private bool _isProcessing = false;
     
     // Timer for refreshing the position display
     private System.Threading.Timer? _positionUpdateTimer;
+
+    // Properties for UI binding related to service status
+#pragma warning disable CS8618 // Properties are initialized at declaration to string.Empty
+    public string ServiceOperationalState { get; set; } = string.Empty;
+    public string CurrentFile { get; set; } = string.Empty;
+    public string LastErrorMessage { get; set; } = string.Empty;
+#pragma warning restore CS8618
 
     // Add a simple class to deserialize the service status
     private class PipeServiceStatus
@@ -64,6 +70,8 @@ public partial class MainWindow : Window
         try
         {
             InitializeComponent();
+            
+            // Constructor initializations for CS8618 were removed as properties are handled at declaration.
             
             try
             {
@@ -175,7 +183,7 @@ public partial class MainWindow : Window
                         }
                     }
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
                     // Handle or log error checking positions file
                 }
@@ -188,7 +196,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private void MainWindow_Loaded(object sender, RoutedEventArgs e)
+    private void MainWindow_Loaded(object? sender, RoutedEventArgs e)
     {
         _logger.LogInformation("MainWindow loaded");
         LoadSettings();
@@ -205,7 +213,7 @@ public partial class MainWindow : Window
         Task.Run(async () => await QueryServiceStatusAsync());
     }
 
-    private async void ServiceStatusTimer_Tick(object sender, EventArgs e)
+    private async void ServiceStatusTimer_Tick(object? sender, EventArgs e)
     {
         await QueryServiceStatusAsync();
         UpdateServiceControlUi(); // Periodically update service control UI
@@ -214,7 +222,7 @@ public partial class MainWindow : Window
     private async Task QueryServiceStatusAsync()
     {
         _logger.LogTrace("Querying Windows service status via IPC...");
-        PipeServiceStatus status = null;
+        PipeServiceStatus? status = null;
         bool serviceAvailable = false;
         bool isInstalled = WindowsServiceManager.IsServiceInstalled();
         ServiceControllerStatus currentScStatus = ServiceControllerStatus.Stopped;
@@ -238,7 +246,7 @@ public partial class MainWindow : Window
 
         if (currentScStatus == ServiceControllerStatus.Running || currentScStatus == ServiceControllerStatus.StartPending)
         {
-            NamedPipeClientStream client = null;
+            NamedPipeClientStream? client = null;
             try
             {
                 _logger.LogDebug("IPC Client: Attempting to create NamedPipeClientStream for pipe '{PipeName}'.", PipeName);
@@ -524,7 +532,7 @@ public partial class MainWindow : Window
         _logger.LogDebug($"UpdateServiceControlUi: Admin={isAdmin}, Installed={serviceInstalled}, Status={status}, StartBtn.IsEnabled={StartBtn.IsEnabled}, StopBtn.IsEnabled={StopBtn.IsEnabled}, InstallBtn.IsEnabled={InstallServiceBtn.IsEnabled}, UninstallBtn.IsEnabled={UninstallServiceBtn.IsEnabled}");
     }
 
-    private void MainWindow_Closing(object sender, CancelEventArgs e)
+    private void MainWindow_Closing(object? sender, CancelEventArgs e)
     {
         _logger.LogInformation("MainWindow closing");
         _serviceStatusTimer?.Stop(); // Stop IPC Timer
@@ -566,7 +574,7 @@ public partial class MainWindow : Window
         _logger.LogInformation("MainWindow closed");
     }
 
-    private void LoadSettings()
+    private async void LoadSettings()
     {
         _logger.LogDebug("Loading application settings");
         try
@@ -629,7 +637,7 @@ public partial class MainWindow : Window
             UpdateServiceStatus(false);
             
             // Update database status
-            UpdateDatabaseStatus();
+            await UpdateDatabaseStatus();
         }
         catch (Exception ex)
         {
@@ -645,7 +653,25 @@ public partial class MainWindow : Window
             _logger.LogInformation("Saving settings...");
             var configFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings.json");
             var configJson = File.ReadAllText(configFile);
-            dynamic configObj = Newtonsoft.Json.JsonConvert.DeserializeObject(configJson);
+            dynamic? configObj = Newtonsoft.Json.JsonConvert.DeserializeObject(configJson);
+
+            if (configObj == null) // CS8602 fix: Check if configObj is null
+            {
+                _logger.LogWarning("appsettings.json was empty or contained only null. Initializing new configuration object.");
+                configObj = new Newtonsoft.Json.Linq.JObject(); // Initialize if null
+            }
+
+            // Ensure DatabaseSettings section exists
+            if (configObj["DatabaseSettings"] == null)
+            {
+                configObj["DatabaseSettings"] = new Newtonsoft.Json.Linq.JObject();
+            }
+
+            // Ensure LogMonitorSettings section exists
+            if (configObj["LogMonitorSettings"] == null)
+            {
+                configObj["LogMonitorSettings"] = new Newtonsoft.Json.Linq.JObject();
+            }
 
             // Capture UI values on the UI thread
             string currentLogDir = LogDirectory.Text;
@@ -989,7 +1015,7 @@ public partial class MainWindow : Window
         UpdateServiceControlUi(); // Ensure UI state is refreshed
     }
 
-    private async void StopBtn_Click(object sender, RoutedEventArgs e)
+    private void StopBtn_Click(object? sender, RoutedEventArgs e)
     {
         _logger.LogInformation($"Stop button clicked. Current content: {StopBtn.Content}");
         if (WindowsServiceManager.IsServiceInstalled())
@@ -1628,7 +1654,7 @@ public partial class MainWindow : Window
             _logger.LogDebug(filterState);
             
             // Get the original text from the Tag property
-            string originalText = LogTextBox.Tag as string;
+            string? originalText = LogTextBox.Tag as string;
             
             // If no original text is available, there's nothing to filter
             if (string.IsNullOrEmpty(originalText))

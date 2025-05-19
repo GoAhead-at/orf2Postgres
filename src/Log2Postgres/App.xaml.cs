@@ -22,8 +22,8 @@ namespace Log2Postgres
     /// </summary>
     public partial class App : System.Windows.Application
     {
-        private readonly IHost _host;
-        private static Mutex _singleInstanceMutex;
+        private IHost? _host;
+        private static Mutex _singleInstanceMutex = null!;
         private const string MutexName = "Log2PostgresAppSingleInstance";
         
         // Win32 API imports for finding and activating existing window
@@ -174,11 +174,19 @@ namespace Log2Postgres
         
         public IConfiguration GetConfiguration()
         {
+            if (_host == null)
+            {
+                throw new InvalidOperationException("Host is not initialized, cannot get configuration.");
+            }
             return _host.Services.GetRequiredService<IConfiguration>();
         }
 
         public T GetService<T>() where T : class
         {
+            if (_host == null)
+            {
+                throw new InvalidOperationException("Host is not initialized, cannot get service.");
+            }
             return _host.Services.GetRequiredService<T>();
         }
 
@@ -277,23 +285,46 @@ namespace Log2Postgres
                 // Create password encryption service and decrypt password if needed
                 var passwordEncryption = new PasswordEncryption(encryptionLogger);
                 
-                // Decrypt the password if it's encrypted
-                if (!string.IsNullOrEmpty(dbSettings.Password) && passwordEncryption.IsEncrypted(dbSettings.Password))
+                // Process password only if dbSettings itself is not null
+                if (dbSettings != null) 
                 {
-                    dbSettings.Password = passwordEncryption.DecryptPassword(dbSettings.Password);
+                    // Decrypt the password if it's present and encrypted
+                    if (!string.IsNullOrEmpty(dbSettings.Password) && passwordEncryption.IsEncrypted(dbSettings.Password))
+                    {
+                        dbSettings.Password = passwordEncryption.DecryptPassword(dbSettings.Password);
+                    }
                 }
+                // If dbSettings is null, its values won't be used in the configuration below.
                 
                 // Register the database settings with the decrypted password
                 services.Configure<DatabaseSettings>(options => 
                 {
-                    options.Host = dbSettings.Host;
-                    options.Port = dbSettings.Port;
-                    options.Username = dbSettings.Username;
-                    options.Password = dbSettings.Password; // This is now the decrypted password
-                    options.Database = dbSettings.Database;
-                    options.Schema = dbSettings.Schema;
-                    options.Table = dbSettings.Table;
-                    options.ConnectionTimeout = dbSettings.ConnectionTimeout;
+                    if (dbSettings != null)
+                    {
+                        // Apply configured values if dbSettings was successfully loaded
+                        options.Host = dbSettings.Host;
+                        options.Port = dbSettings.Port;
+                        options.Username = dbSettings.Username;
+                        options.Password = dbSettings.Password; // This is now the (potentially) decrypted password
+                        options.Database = dbSettings.Database;
+                        options.Schema = dbSettings.Schema;
+                        options.Table = dbSettings.Table;
+                        options.ConnectionTimeout = dbSettings.ConnectionTimeout;
+                    }
+                    else
+                    {
+                        // If dbSettings is null (e.g., section missing in appsettings.json),
+                        // explicitly set defaults for options. The DatabaseSettings class itself
+                        // has defaults, but being explicit here ensures clarity.
+                        options.Host = "localhost"; 
+                        options.Port = "5432";      
+                        options.Username = string.Empty;
+                        options.Password = string.Empty;
+                        options.Database = "postgres"; 
+                        options.Schema = "public";   
+                        options.Table = "orf_logs"; 
+                        options.ConnectionTimeout = 30; 
+                    }
                 });
                 
                 // Get log monitor settings from configuration
@@ -302,9 +333,19 @@ namespace Log2Postgres
                 // Register configuration sections for log monitor settings with default values if needed
                 services.Configure<LogMonitorSettings>(options =>
                 {
-                    options.BaseDirectory = logMonitorSettings.BaseDirectory ?? string.Empty; 
-                    options.LogFilePattern = logMonitorSettings.LogFilePattern ?? "orfee-{Date:yyyy-MM-dd}.log";
-                    options.PollingIntervalSeconds = logMonitorSettings.PollingIntervalSeconds > 0 ? logMonitorSettings.PollingIntervalSeconds : 5;
+                    if (logMonitorSettings != null)
+                    {
+                        options.BaseDirectory = logMonitorSettings.BaseDirectory ?? string.Empty; 
+                        options.LogFilePattern = logMonitorSettings.LogFilePattern ?? "orfee-{Date:yyyy-MM-dd}.log";
+                        options.PollingIntervalSeconds = logMonitorSettings.PollingIntervalSeconds > 0 ? logMonitorSettings.PollingIntervalSeconds : 5;
+                    }
+                    else
+                    {
+                        // If logMonitorSettings is null, use default values
+                        options.BaseDirectory = string.Empty;
+                        options.LogFilePattern = "orfee-{Date:yyyy-MM-dd}.log";
+                        options.PollingIntervalSeconds = 5;
+                    }
                 });
                 
                 // Register core processing services as singletons
