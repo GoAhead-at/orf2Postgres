@@ -23,8 +23,16 @@ using System.Text;
 using Newtonsoft.Json;
 using System.Windows.Threading;
 using System.ServiceProcess;
+using System.Threading; // Added for CancellationTokenSource
 
 namespace Log2Postgres;
+
+// Define IpcMessage structure (can be shared with service later)
+public class IpcMessage<T>
+{
+    public string Type { get; set; } = string.Empty;
+    public T? Payload { get; set; }
+}
 
 /// <summary>
 /// Interaction logic for MainWindow.xaml
@@ -36,6 +44,50 @@ public partial class MainWindow : Window
 
     private const int MaxUiLogLines = 500; // Added constant for max log lines
 
+            private NamedPipeClientStream? _servicePipeClient;
+        private StreamReader? _servicePipeReader;
+        private StreamWriter? _servicePipeWriter;
+        private CancellationTokenSource? _pipeListenerCts;
+        private Task? _pipeListenerTask;
+        private readonly object _pipeLock = new object();
+        private bool _isPipeConnected = false;
+
+    private const string DefaultAppSettingsJson = @"{
+  ""Serilog"": {
+    ""MinimumLevel"": {
+      ""Default"": ""Debug"",
+      ""Override"": {
+        ""Microsoft"": ""Information"",
+        ""System"": ""Information""
+      }
+    },
+    ""WriteTo"": [
+      {
+        ""Name"": ""Console"",
+        ""Args"": {
+          ""outputTemplate"": ""[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj} {Properties:j}{NewLine}{Exception}""
+        }
+      }
+    ],
+    ""Enrich"": [ ""FromLogContext"", ""WithThreadId"", ""WithMachineName"", ""WithProcessId"" ]
+  },
+  ""DatabaseSettings"": {
+    ""Host"": ""localhost"",
+    ""Port"": ""5432"",
+    ""Username"": ""orf"",
+    ""Password"": """",
+    ""Database"": ""orf"",
+    ""Schema"": ""orf"",
+    ""Table"": ""orf_logs"",
+    ""ConnectionTimeout"": 30
+  },
+  ""LogMonitorSettings"": {
+    ""BaseDirectory"": """",
+    ""LogFilePattern"": ""orfee-{Date:yyyy-MM-dd}.log"",
+    ""PollingIntervalSeconds"": 5
+  }
+}";
+
     private readonly IConfiguration _configuration = null!;
     private readonly PostgresService _postgresService = null!;
     private readonly LogFileWatcher _logFileWatcher = null!;
@@ -43,6 +95,7 @@ public partial class MainWindow : Window
     private readonly PasswordEncryption _passwordEncryption = null!;
     private readonly PositionManager _positionManager = null!;
     private bool _isProcessing = false;
+    private bool _hasUnsavedChanges = false; // Flag for unsaved changes
     
     // Timer for refreshing the position display
     private System.Threading.Timer? _positionUpdateTimer;
@@ -93,9 +146,20 @@ public partial class MainWindow : Window
                 {
                     _logFileWatcher = app.GetService<LogFileWatcher>();
                 }
-                catch (Exception)
+                catch (Exception ex_lfw) // Catch and log the specific exception
                 {
-                    // Handle or log error getting LogFileWatcher if necessary
+                    // Log the detailed exception when LogFileWatcher fails to resolve
+                    if (_logger != null) // Check if logger itself was initialized
+                    {
+                        _logger.LogError(ex_lfw, "Failed to get LogFileWatcher service from DI container.");
+                    }
+                    else
+                    {
+                        // Fallback if logger is not available
+                        System.Diagnostics.Debug.WriteLine($"Critical Error: Failed to get LogFileWatcher. Logger not available. Exception: {ex_lfw}");
+                        System.Windows.MessageBox.Show($"Critical Error: Could not initialize the LogFileWatcher service. Exception: {ex_lfw.Message}", "Service Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    }
+                    // _logFileWatcher will remain null, subsequent checks will handle it
                 }
                 
                 try
@@ -200,126 +264,340 @@ public partial class MainWindow : Window
     {
         _logger.LogInformation("MainWindow loaded");
         LoadSettings();
+        UpdateDbActionButtonsState();
         UpdateStatusBar("Application started successfully");
         
-        // Initialize and start IPC status timer
         _serviceStatusTimer = new DispatcherTimer();
-        _serviceStatusTimer.Interval = TimeSpan.FromSeconds(5); // Query every 5 seconds
+        _serviceStatusTimer.Interval = TimeSpan.FromSeconds(5); 
         _serviceStatusTimer.Tick += ServiceStatusTimer_Tick;
         _serviceStatusTimer.Start();
         _logger.LogInformation("Service status timer started for IPC.");
 
-        // Initial query
-        Task.Run(async () => await QueryServiceStatusAsync());
+        Task.Run(async () => await EnsureConnectedToServicePipeAsync());
     }
 
     private async void ServiceStatusTimer_Tick(object? sender, EventArgs e)
     {
-        await QueryServiceStatusAsync();
-        UpdateServiceControlUi(); // Periodically update service control UI
-    }
-
-    private async Task QueryServiceStatusAsync()
-    {
-        _logger.LogTrace("Querying Windows service status via IPC...");
-        PipeServiceStatus? status = null;
-        bool serviceAvailable = false;
-        bool isInstalled = WindowsServiceManager.IsServiceInstalled();
-        ServiceControllerStatus currentScStatus = ServiceControllerStatus.Stopped;
-
-        if (isInstalled)
+        if (!_isPipeConnected)
+        {
+            await EnsureConnectedToServicePipeAsync();
+        }
+        else if (_servicePipeWriter != null)
         {
             try
             {
-                currentScStatus = WindowsServiceManager.GetServiceStatus();
+                await _servicePipeWriter.WriteLineAsync("GET_STATUS");
+                _logger.LogDebug("IPC Client: Sent GET_STATUS request via persistent connection.");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error directly querying service status via ServiceController.");
+                _logger.LogError(ex, "IPC Client: Error sending GET_STATUS via persistent connection.");
+                await AttemptPipeReconnectAsync();
+            }
+        }
+        UpdateServiceControlUi();
+    }
+
+    // ---- NEW IPC METHODS START ----
+    private async Task EnsureConnectedToServicePipeAsync()
+    {
+        bool isServiceRunning = false;
+        try
+        {
+            if (WindowsServiceManager.IsServiceInstalled())
+            {
+                var scStatus = WindowsServiceManager.GetServiceStatus();
+                if (scStatus == ServiceControllerStatus.Running || scStatus == ServiceControllerStatus.StartPending)
+                {
+                    isServiceRunning = true;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error checking service status for pipe connection.");
+        }
+
+        if (!isServiceRunning)
+        {
+            if (_isPipeConnected) 
+            {
+                _logger.LogInformation("Service is not running. Disconnecting pipe.");
+                await DisconnectFromServicePipeAsync();
+            }
+            UpdateUiWithServiceStatus(null, false, WindowsServiceManager.GetServiceStatus(), WindowsServiceManager.IsServiceInstalled());
+            return;
+        }
+
+        if (isServiceRunning && !_isPipeConnected)
+        {
+            _logger.LogInformation("Service is running, attempting to connect IPC pipe.");
+            await ConnectToServicePipeAsync();
+        }
+    }
+
+    private async Task ConnectToServicePipeAsync()
+    {
+        if (_isPipeConnected) return;
+        lock (_pipeLock) 
+        {
+            if (_isPipeConnected || _pipeListenerTask != null && !_pipeListenerTask.IsCompleted) 
+            {
+                _logger.LogDebug("Pipe connection or listener task already active/pending. Skipping new connection attempt.");
+                return; 
+            }
+        }
+        
+        _logger.LogInformation("Attempting to connect to service pipe: {PipeName}", PipeName);
+        
+        const int maxRetries = 3;
+        const int connectTimeoutMs = 3000; // 3 seconds timeout for each attempt
+        const int retryDelayMs = 2000;    // 2 seconds delay between retries
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                _logger.LogInformation("Connection attempt {AttemptNumber}/{MaxAttempts} to pipe: {PipeName}", attempt, maxRetries, PipeName);
+                _servicePipeClient = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+                await _servicePipeClient.ConnectAsync(connectTimeoutMs); 
+
+                if (_servicePipeClient.IsConnected)
+                {
+                    _servicePipeReader = new StreamReader(_servicePipeClient);
+                    _servicePipeWriter = new StreamWriter(_servicePipeClient) { AutoFlush = true };
+                    _isPipeConnected = true;
+
+                    _pipeListenerCts = new CancellationTokenSource();
+                    _pipeListenerTask = Task.Run(() => ListenForServiceMessagesAsync(_pipeListenerCts.Token), _pipeListenerCts.Token);
+                    _logger.LogInformation("Successfully connected to service pipe and started listener after {AttemptNumber} attempt(s).", attempt);
+                    
+                    if (_servicePipeWriter != null)
+                    {
+                        await _servicePipeWriter.WriteLineAsync("GET_STATUS");
+                    }
+                    return; // Connection successful, exit method
+                }
+                // This part should ideally not be reached if ConnectAsync throws on timeout,
+                // but included for completeness if it returns without connecting.
+                _logger.LogWarning("ConnectAsync completed but pipe not connected on attempt {AttemptNumber}.", attempt);
+                await _servicePipeClient.DisposeAsync(); // Clean up the unsuccessful client
+                _servicePipeClient = null;
+
+            }
+            catch (System.TimeoutException) // Explicitly use System.TimeoutException
+            {
+                _logger.LogWarning("Timeout connecting to service pipe on attempt {AttemptNumber}/{MaxAttempts}.", attempt, maxRetries);
+                if (_servicePipeClient != null) await _servicePipeClient.DisposeAsync();
+                _servicePipeClient = null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Exception during ConnectToServicePipeAsync attempt {AttemptNumber}/{MaxAttempts}.", attempt, maxRetries);
+                if (_servicePipeClient != null) await _servicePipeClient.DisposeAsync();
+                _servicePipeClient = null;
+                // For unexpected errors, break the loop and proceed to disconnect.
+                // We don't want to keep retrying on, for example, a fundamental configuration error.
+                break; 
+            }
+
+            if (attempt < maxRetries)
+            {
+                _logger.LogInformation("Waiting {DelayMs}ms before next connection attempt.", retryDelayMs);
+                await Task.Delay(retryDelayMs);
+            }
+        }
+
+        // If all retries failed
+        _logger.LogError("Failed to connect to service pipe after {MaxAttempts} attempts.", maxRetries);
+        await DisconnectFromServicePipeAsync(true); 
+    }
+
+    private async Task ListenForServiceMessagesAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("IPC Message Listener: Started.");
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested && _servicePipeReader != null && _isPipeConnected)
+            {
+                string? jsonMessage = await _servicePipeReader.ReadLineAsync(cancellationToken);
+                if (jsonMessage == null)
+                {
+                    _logger.LogInformation("IPC Message Listener: Pipe closed by server or stream ended.");
+                    break; 
+                }
+
+                _logger.LogDebug("IPC Message Listener: Received raw message: {JsonMessage}", jsonMessage);
+                try
+                {
+                    var genericMessage = JsonConvert.DeserializeObject<IpcMessage<object>>(jsonMessage);
+                    if (genericMessage == null || string.IsNullOrEmpty(genericMessage.Type))
+                    {
+                        _logger.LogWarning("IPC Message Listener: Received malformed IPC message (no type): {JsonMessage}", jsonMessage);
+                        continue;
+                    }
+                    _logger.LogInformation("IPC Message Listener: Message Type = {MessageType}", genericMessage.Type);
+
+                    switch (genericMessage.Type)
+                    {
+                        case "LOG_ENTRIES":
+                            _logger.LogDebug("IPC Message Listener: Processing LOG_ENTRIES message.");
+                            var logEntriesMessage = JsonConvert.DeserializeObject<IpcMessage<List<string>>>(jsonMessage);
+                            if (logEntriesMessage?.Payload != null)
+                            {
+                                _logger.LogInformation("IPC Message Listener: Received {Count} log entries from service.", logEntriesMessage.Payload.Count);
+                                Dispatcher.InvokeAsync(() => {
+                                    foreach (var logEntry in logEntriesMessage.Payload)
+                                    {
+                                        AppendAndTrimLog($"[SERVICE] {logEntry}"); 
+                                    }
+                                });
+                            }
+                            else
+                            {
+                                _logger.LogWarning("IPC Message Listener: LOG_ENTRIES message payload is null or message deserialization failed. Raw: {JsonMessage}", jsonMessage);
+                            }
+                            break;
+                        case "SERVICE_STATUS": 
+                            var statusMessage = JsonConvert.DeserializeObject<IpcMessage<PipeServiceStatus>>(jsonMessage);
+                            if (statusMessage?.Payload != null)
+                            {
+                                UpdateUiWithServiceStatus(statusMessage.Payload, true, WindowsServiceManager.GetServiceStatus(), WindowsServiceManager.IsServiceInstalled());
+                            }
+                            break;
+                        default:
+                            _logger.LogWarning("IPC Message Listener: Received unknown IPC message type: {MessageType}", genericMessage.Type);
+                            break;
+                    }
+                }
+                catch (JsonException jsonEx)
+                { 
+                    _logger.LogError(jsonEx, "IPC Message Listener: JSON deserialization error: {JsonMessage}", jsonMessage);
+                }
+                catch (Exception ex)
+                { 
+                    _logger.LogError(ex, "IPC Message Listener: Error processing message: {JsonMessage}", jsonMessage);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("IPC Message Listener: Operation cancelled.");
+        }
+        catch (IOException ioEx)
+        {
+            _logger.LogWarning(ioEx, "IPC Message Listener: IOException (pipe likely closed).");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "IPC Message Listener: An unhandled exception occurred.");
+        }
+        finally
+        {
+            _logger.LogInformation("IPC Message Listener: Stopping.");
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                await Dispatcher.InvokeAsync(async () => await AttemptPipeReconnectAsync());
+            }
+        }
+    }
+    
+    private async Task AttemptPipeReconnectAsync()
+    {
+        _logger.LogInformation("Attempting to reconnect to service pipe due to disconnection or error.");
+        await DisconnectFromServicePipeAsync(true); 
+        await Task.Delay(2000); 
+        await EnsureConnectedToServicePipeAsync(); 
+    }
+
+    private async Task DisconnectFromServicePipeAsync(bool fromErrorOrClosure = false)
+    {
+        _logger.LogInformation("DisconnectFromServicePipeAsync called. FromErrorOrClosure: {FromError}", fromErrorOrClosure);
+        if (!_isPipeConnected && !fromErrorOrClosure && _pipeListenerTask == null) 
+        { 
+            _logger.LogDebug("Pipe already disconnected or never connected.");
+            return;
+        }
+        lock(_pipeLock)
+        {
+            if (_pipeListenerCts != null)
+            {
+                if (!_pipeListenerCts.IsCancellationRequested) _pipeListenerCts.Cancel();
+                _pipeListenerCts.Dispose();
+                _pipeListenerCts = null;
+                _logger.LogDebug("Pipe listener CTS cancelled and disposed.");
+            }
+        }
+        if (_pipeListenerTask != null)
+        {
+            try
+            {
+                _logger.LogDebug("Waiting for pipe listener task to complete...");
+                bool completedInTime = await Task.WhenAny(_pipeListenerTask, Task.Delay(2000)) == _pipeListenerTask;
+                if (completedInTime)
+                {
+                    _logger.LogInformation("Pipe listener task completed.");
+                }
+                else
+                {
+                    _logger.LogWarning("Pipe listener task did not complete within timeout during disconnect.");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Exception waiting for pipe listener task on disconnect.");
+            }
+            _pipeListenerTask = null;
+        }
+        lock(_pipeLock)
+        {
+            if (_servicePipeWriter != null) { try { _servicePipeWriter.Dispose(); } catch {} _servicePipeWriter = null; }
+            if (_servicePipeReader != null) { try { _servicePipeReader.Dispose(); } catch {} _servicePipeReader = null; }
+            if (_servicePipeClient != null) { try { _servicePipeClient.Close(); _servicePipeClient.Dispose(); } catch {} _servicePipeClient = null; }
+            _isPipeConnected = false;
+            _logger.LogInformation("Service pipe client and streams disposed. _isPipeConnected set to false.");
+        }
+        if (fromErrorOrClosure)
+        {
+            UpdateUiWithServiceStatus(null, false, WindowsServiceManager.GetServiceStatus(), WindowsServiceManager.IsServiceInstalled());
+        }
+    }
+    // ---- NEW IPC METHODS END ----
+
+    private async Task RequestServiceStatusUpdateAsync()
+    {
+        // If not connected, we rely on the existing timer or connection logic
+        // to eventually establish a connection and get status.
+        // This method's prime role is to request an update if already connected.
+        if (!_isPipeConnected)
+        {
+            _logger.LogInformation("RequestServiceStatusUpdateAsync: Pipe not connected. Status update will occur once connection is established by other mechanisms.");
+            // Optionally, one could call await EnsureConnectedToServicePipeAsync(); here
+            // if an immediate connection attempt is desired, but EnsureConnectedToServicePipeAsync
+            // itself sends GET_STATUS upon successful connection.
+            return;
+        }
+
+        if (_servicePipeWriter != null)
+        {
+            try
+            {
+                _logger.LogInformation("RequestServiceStatusUpdateAsync: Sending GET_STATUS request via persistent connection.");
+                await _servicePipeWriter.WriteLineAsync("GET_STATUS");
+                // Response will be handled by ListenForServiceMessagesAsync
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "RequestServiceStatusUpdateAsync: Error sending GET_STATUS.");
+                await AttemptPipeReconnectAsync(); // Use existing error handling for pipe issues
             }
         }
         else
         {
-            UpdateUiWithServiceStatus(null, false, currentScStatus, false);
-            return;
+            // This state (connected but no writer) should ideally not happen with current logic.
+            _logger.LogWarning("RequestServiceStatusUpdateAsync: Pipe is marked connected, but _servicePipeWriter is null. Attempting reconnect.");
+            await AttemptPipeReconnectAsync();
         }
-
-        if (currentScStatus == ServiceControllerStatus.Running || currentScStatus == ServiceControllerStatus.StartPending)
-        {
-            NamedPipeClientStream? client = null;
-            try
-            {
-                _logger.LogDebug("IPC Client: Attempting to create NamedPipeClientStream for pipe '{PipeName}'.", PipeName);
-                client = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-                _logger.LogInformation("IPC Client: NamedPipeClientStream object created for pipe '{PipeName}'.", PipeName);
-
-                _logger.LogDebug("IPC Client: Attempting to connect to pipe '{PipeName}' with timeout {Timeout}ms...", PipeName, 10000);
-                await client.ConnectAsync(10000); 
-                _logger.LogInformation("IPC Client: Successfully connected to IPC pipe: {PipeName}", PipeName);
-                serviceAvailable = true;
-
-                _logger.LogDebug("IPC Client: Attempting to send GET_STATUS request to service on pipe '{PipeName}'.", PipeName);
-                byte[] requestBytes = Encoding.UTF8.GetBytes("GET_STATUS");
-                await client.WriteAsync(requestBytes, 0, requestBytes.Length);
-                await client.FlushAsync();
-                _logger.LogInformation("IPC Client: Successfully sent GET_STATUS request to service on pipe '{PipeName}'.", PipeName);
-
-                _logger.LogDebug("IPC Client: Attempting to read response from service on pipe '{PipeName}'.", PipeName);
-                byte[] buffer = new byte[4096]; 
-                int bytesRead = await client.ReadAsync(buffer, 0, buffer.Length);
-                _logger.LogInformation("IPC Client: Successfully read {BytesRead} bytes from service on pipe '{PipeName}'.", bytesRead, PipeName);
-                string jsonResponse = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                _logger.LogDebug("IPC Client: Received IPC response: {JsonResponse}", jsonResponse);
-
-                if (!string.IsNullOrWhiteSpace(jsonResponse))
-                {
-                    status = JsonConvert.DeserializeObject<PipeServiceStatus>(jsonResponse);
-                    _logger.LogDebug("IPC Client: Deserialized status. LastErrorMessage: '{ErrorMessage}', OperationalState: '{OpState}'", status?.LastErrorMessage, status?.ServiceOperationalState);
-                    serviceAvailable = true;
-                }
-            }
-            catch (System.TimeoutException tex) 
-            {
-                _logger.LogWarning(tex, "IPC Client: Timeout connecting to pipe '{PipeName}'. Service might be starting, stopping, or unresponsive.", PipeName);
-                serviceAvailable = false; 
-            }
-            catch (IOException ioex)
-            {
-                 _logger.LogWarning(ioex, "IPC Client: IOException with pipe '{PipeName}'. Pipe may have broken or not ready.", PipeName);
-                 serviceAvailable = false;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "IPC Client: Generic exception during IPC status query for pipe '{PipeName}'.", PipeName);
-                serviceAvailable = false; 
-            }
-            finally
-            {
-                if (client != null)
-                {
-                    if (client.IsConnected)
-                    {
-                        try
-                        {
-                            client.Close(); 
-                        }
-                        catch (Exception exClose)
-                        {
-                            _logger.LogWarning(exClose, "IPC Client: Exception while closing pipe '{PipeName}'.", PipeName);
-                        }
-                    }
-                    client.Dispose();
-                    _logger.LogDebug("IPC Client: NamedPipeClientStream for pipe '{PipeName}' disposed.", PipeName);
-                }
-            }
-        }
-        else 
-        {
-             _logger.LogInformation("Service 'Log2Postgres' is installed but not running (Status: {Status}). Skipping IPC check.", currentScStatus);
-             serviceAvailable = false; 
-        }
-        
-        UpdateUiWithServiceStatus(status, serviceAvailable, currentScStatus, isInstalled);
     }
 
     private async Task<bool> SendUpdateSettingsToServiceAsync(LogMonitorSettings settings)
@@ -638,6 +916,9 @@ public partial class MainWindow : Window
             
             // Update database status
             await UpdateDatabaseStatus();
+
+            _hasUnsavedChanges = false; // Settings are now in sync with UI
+            UpdateDbActionButtonsState(); // Update DB buttons based on loaded settings
         }
         catch (Exception ex)
         {
@@ -646,108 +927,138 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SaveSettings()
+    private async void SaveSettings()
     {
         try
         {
             _logger.LogInformation("Saving settings...");
             var configFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "appsettings.json");
-            var configJson = File.ReadAllText(configFile);
-            dynamic? configObj = Newtonsoft.Json.JsonConvert.DeserializeObject(configJson);
+            Newtonsoft.Json.Linq.JObject? configObj;
+            bool isNewFile = !File.Exists(configFile);
 
-            if (configObj == null) // CS8602 fix: Check if configObj is null
+            if (isNewFile)
             {
-                _logger.LogWarning("appsettings.json was empty or contained only null. Initializing new configuration object.");
-                configObj = new Newtonsoft.Json.Linq.JObject(); // Initialize if null
+                _logger.LogInformation($"appsettings.json not found at {configFile}. A new SUPER-MINIMAL file will be created for testing (LogMonitorSettings ONLY).");
+                configObj = new Newtonsoft.Json.Linq.JObject();
+                var logMonitorSettingsObj = new Newtonsoft.Json.Linq.JObject();
+                logMonitorSettingsObj["BaseDirectory"] = LogDirectory.Text;
+                logMonitorSettingsObj["LogFilePattern"] = LogFilePattern.Text;
+                logMonitorSettingsObj["PollingIntervalSeconds"] = int.TryParse(PollingInterval.Text, out int intervalTmp) ? intervalTmp : 5;
+                configObj["LogMonitorSettings"] = logMonitorSettingsObj;
+            }
+            else
+            {
+                var configJson = File.ReadAllText(configFile);
+                configObj = Newtonsoft.Json.JsonConvert.DeserializeObject<Newtonsoft.Json.Linq.JObject>(configJson);
+                if (configObj == null) { 
+                    _logger.LogWarning("Config file existed but deserialized to null. Reinitializing.");
+                    configObj = new Newtonsoft.Json.Linq.JObject();
+                }
+                Newtonsoft.Json.Linq.JObject logMonitorSettingsJsonExisting;
+                if (configObj["LogMonitorSettings"] is Newtonsoft.Json.Linq.JObject existingLMS) {
+                    logMonitorSettingsJsonExisting = existingLMS;
+                } else {
+                    logMonitorSettingsJsonExisting = new Newtonsoft.Json.Linq.JObject();
+                    configObj["LogMonitorSettings"] = logMonitorSettingsJsonExisting;
+                }
+                logMonitorSettingsJsonExisting["BaseDirectory"] = LogDirectory.Text;
+                logMonitorSettingsJsonExisting["LogFilePattern"] = LogFilePattern.Text;
+                logMonitorSettingsJsonExisting["PollingIntervalSeconds"] = int.TryParse(PollingInterval.Text, out int intervalTmp2) ? intervalTmp2 : 5;
+
+                Newtonsoft.Json.Linq.JObject dbSettingsJson;
+                if (configObj["DatabaseSettings"] is Newtonsoft.Json.Linq.JObject existingDb) {
+                    dbSettingsJson = existingDb;
+                } else {
+                    dbSettingsJson = new Newtonsoft.Json.Linq.JObject();
+                    configObj["DatabaseSettings"] = dbSettingsJson;
+                    var defaultDb = Newtonsoft.Json.JsonConvert.DeserializeObject<Newtonsoft.Json.Linq.JObject>(DefaultAppSettingsJson)?["DatabaseSettings"];
+                    if (defaultDb != null) configObj["DatabaseSettings"] = defaultDb;
+                }
+                dbSettingsJson["Host"] = DbHost.Text;
+                dbSettingsJson["Port"] = DbPort.Text;
+                dbSettingsJson["Username"] = DbUsername.Text;
+                dbSettingsJson["Password"] = SecurePassword(); 
+                dbSettingsJson["Database"] = DbName.Text; 
+                dbSettingsJson["Schema"] = DbSchema.Text;
+                dbSettingsJson["Table"] = DbTable.Text;
+                dbSettingsJson["ConnectionTimeout"] = int.TryParse(DbTimeout.Text, out int timeoutDb) ? timeoutDb : 30;
+
+                if (configObj["Serilog"] == null) {
+                    var defaultSerilog = Newtonsoft.Json.JsonConvert.DeserializeObject<Newtonsoft.Json.Linq.JObject>(DefaultAppSettingsJson)?["Serilog"];
+                    if (defaultSerilog != null) configObj["Serilog"] = defaultSerilog;
+                }
             }
 
-            // Ensure DatabaseSettings section exists
-            if (configObj["DatabaseSettings"] == null)
-            {
-                configObj["DatabaseSettings"] = new Newtonsoft.Json.Linq.JObject();
-            }
-
-            // Ensure LogMonitorSettings section exists
-            if (configObj["LogMonitorSettings"] == null)
-            {
-                configObj["LogMonitorSettings"] = new Newtonsoft.Json.Linq.JObject();
-            }
-
-            // Capture UI values on the UI thread
-            string currentLogDir = LogDirectory.Text;
-            string currentLogPattern = LogFilePattern.Text;
-            string currentPollingIntervalStr = PollingInterval.Text;
-            int currentPollingInterval = int.TryParse(currentPollingIntervalStr, out int intervalVal) ? intervalVal : 5; // Default if parse fails
-
-            configObj["DatabaseSettings"]["Host"] = DbHost.Text;
-            configObj["DatabaseSettings"]["Port"] = DbPort.Text;
-            configObj["DatabaseSettings"]["Username"] = DbUsername.Text;
-            string securedPassword = SecurePassword(); 
-            configObj["DatabaseSettings"]["Password"] = securedPassword;
-            configObj["DatabaseSettings"]["Database"] = DbName.Text; 
-            configObj["DatabaseSettings"]["Schema"] = DbSchema.Text;
-            configObj["DatabaseSettings"]["Table"] = DbTable.Text;
-
-            configObj["LogMonitorSettings"]["BaseDirectory"] = currentLogDir;
-            configObj["LogMonitorSettings"]["LogFilePattern"] = currentLogPattern;
-            configObj["LogMonitorSettings"]["PollingIntervalSeconds"] = currentPollingIntervalStr; // Store as string as it was
-            
             string updatedJson = Newtonsoft.Json.JsonConvert.SerializeObject(configObj, Newtonsoft.Json.Formatting.Indented);
             File.WriteAllText(configFile, updatedJson);
+            _logger.LogInformation("Settings saved successfully to appsettings.json");
 
-            LogMessage("Settings saved successfully to appsettings.json");
-            UpdateStatusBar("Configuration saved to appsettings.json");
-            
-            Task.Run(async () => 
+            if (_configuration is Microsoft.Extensions.Configuration.IConfigurationRoot configurationRoot)
             {
-                _logger.LogDebug("SaveSettings.Task.Run: Entered Task.Run block.");
-                
-                // Create settings object from captured values for internal use and IPC
-                var settingsForReloadAndIpc = new LogMonitorSettings
-                {
-                    BaseDirectory = currentLogDir,
-                    LogFilePattern = currentLogPattern,
-                    PollingIntervalSeconds = currentPollingInterval
-                };
+                _logger.LogInformation("Attempting to force IConfigurationRoot.Reload()");
+                configurationRoot.Reload();
+                _logger.LogInformation("IConfigurationRoot.Reload() called.");
+            }
+            else
+            {
+                _logger.LogWarning("Cannot force configuration reload: _configuration is not IConfigurationRoot.");
+            }
 
-                await ReloadConfiguration(settingsForReloadAndIpc); 
-                _logger.LogInformation("SaveSettings.Task.Run: ReloadConfiguration completed. Now checking service status for IPC.");
+            var settingsForReloadAndIpc = new LogMonitorSettings
+            {
+                BaseDirectory = LogDirectory.Text,
+                LogFilePattern = LogFilePattern.Text,
+                PollingIntervalSeconds = int.TryParse(PollingInterval.Text, out int currentIntervalVal) ? currentIntervalVal : 5 
+            };
 
-                // Pass the same settingsForReloadAndIpc to SendUpdateSettingsToServiceAsync
-                bool serviceInstalled = WindowsServiceManager.IsServiceInstalled();
-                ServiceControllerStatus serviceStatus = ServiceControllerStatus.Stopped; 
-                if(serviceInstalled)
-                {
-                    try { serviceStatus = WindowsServiceManager.GetServiceStatus(); }
-                    catch (Exception ex) { _logger.LogError(ex, "SaveSettings.Task.Run: Error getting service status."); }
-                }
-                
-                _logger.LogInformation("SaveSettings.Task.Run: IPC Check: ServiceInstalled={IsInstalled}, ServiceStatus={Status}.", 
-                    serviceInstalled, serviceStatus);
+            bool serviceInstalled = WindowsServiceManager.IsServiceInstalled();
+            ServiceControllerStatus serviceStatus = ServiceControllerStatus.Stopped;
+            if (serviceInstalled)
+            {
+                try { serviceStatus = WindowsServiceManager.GetServiceStatus(); }
+                catch (Exception ex) { _logger.LogError(ex, "SaveSettings: Error getting service status for intended state check."); }
+            }
+            bool intendedLocalProcessingState = _isProcessing && (!serviceInstalled || serviceStatus != ServiceControllerStatus.Running);
+            _logger.LogDebug($"SaveSettings: Intended local processing state after save: {intendedLocalProcessingState} (based on current _isProcessing: {_isProcessing}, serviceInstalled: {serviceInstalled}, serviceStatus: {serviceStatus})");
+            
+            await ReloadConfiguration(settingsForReloadAndIpc, intendedLocalProcessingState); 
+            _logger.LogInformation("ReloadConfiguration completed. Now checking service status for IPC.");
 
-                if (serviceInstalled && serviceStatus == ServiceControllerStatus.Running)
+            bool currentServiceInstalled = WindowsServiceManager.IsServiceInstalled(); 
+            ServiceControllerStatus currentServiceStatus = ServiceControllerStatus.Stopped; 
+            if(currentServiceInstalled) 
+            {
+                try { currentServiceStatus = WindowsServiceManager.GetServiceStatus(); }
+                catch (Exception ex) { _logger.LogError(ex, "SaveSettings: Error getting service status post-reload."); }
+            }
+            
+            _logger.LogInformation("IPC Check: ServiceInstalled={IsInstalled}, ServiceStatus={Status}.", 
+                currentServiceInstalled, currentServiceStatus);
+
+            if (currentServiceInstalled && currentServiceStatus == ServiceControllerStatus.Running)
+            {
+                _logger.LogInformation("Service is running. Attempting SendUpdateSettingsToServiceAsync.");
+                bool ipcUpdateSuccess = await SendUpdateSettingsToServiceAsync(settingsForReloadAndIpc);
+                if (ipcUpdateSuccess)
                 {
-                    _logger.LogInformation("SaveSettings.Task.Run: Service is running. Attempting SendUpdateSettingsToServiceAsync.");
-                    bool ipcUpdateSuccess = await SendUpdateSettingsToServiceAsync(settingsForReloadAndIpc); // Use the same settings object
-                    if (ipcUpdateSuccess)
-                    {
-                        _logger.LogInformation("SaveSettings.Task.Run: IPC update of LogMonitorSettings to service succeeded.");
-                        Dispatcher.Invoke(() => LogMessage("Running service notified of settings change."));
-                        await QueryServiceStatusAsync(); 
-                    }
-                    else
-                    {
-                        _logger.LogError("SaveSettings.Task.Run: IPC update of LogMonitorSettings to service failed.");
-                        Dispatcher.Invoke(() => LogError("Settings saved, but failed to update running service in real-time. Restart service to apply."));
-                    }
+                    _logger.LogInformation("IPC update of LogMonitorSettings to service succeeded.");
+                    Dispatcher.Invoke(() => LogMessage("Running service notified of settings change."));
+                    await RequestServiceStatusUpdateAsync(); 
                 }
                 else
                 {
-                     _logger.LogInformation("SaveSettings.Task.Run: Service not running/installed for IPC update. ServiceInstalled={IsInstalled}, ServiceStatus={Status}. Local settings reloaded.",
-                         serviceInstalled, serviceStatus);
+                    _logger.LogError("IPC update of LogMonitorSettings to service failed.");
+                    Dispatcher.Invoke(() => LogError("Settings saved, but failed to update running service in real-time. Restart service to apply."));
                 }
-                _logger.LogDebug("SaveSettings.Task.Run: Exiting Task.Run block.");
-            });
+            }
+            else
+            {
+                 _logger.LogInformation("Service not running/installed for IPC update. ServiceInstalled={IsInstalled}, ServiceStatus={Status}. Local settings reloaded.",
+                     currentServiceInstalled, currentServiceStatus);
+            }
+            LogMessage("Settings saved successfully to appsettings.json"); 
+            UpdateStatusBar("Configuration saved to appsettings.json");   
+            _hasUnsavedChanges = false; // Settings have been saved
         }
         catch (Exception ex)
         {
@@ -761,42 +1072,107 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Reloads the configuration and restarts the LogFileWatcher service
+    /// Reloads the configuration for the LogFileWatcher and ensures local processing state is maintained.
     /// </summary>
-    private async Task ReloadConfiguration(LogMonitorSettings settingsToApply)
+    private async Task ReloadConfiguration(LogMonitorSettings settingsToApply, bool wasLocalProcessingIntended)
     {
-        _logger.LogDebug("ReloadConfiguration: Entered method."); 
+        _logger.LogDebug($"ReloadConfiguration: Entered method. Was local processing intended to be active: {wasLocalProcessingIntended}");
+        _logger.LogDebug($"ReloadConfiguration: Settings to apply to LogFileWatcher: BaseDirectory='{settingsToApply.BaseDirectory}', Pattern='{settingsToApply.LogFilePattern}', Interval={settingsToApply.PollingIntervalSeconds}");
+
         try
         {
-            _logger.LogDebug("ReloadConfiguration: Applying LogMonitorSettings: Dir='{Dir}', Pattern='{Pattern}', Interval={Interval}",
-                settingsToApply.BaseDirectory, settingsToApply.LogFilePattern, settingsToApply.PollingIntervalSeconds);
-
-            if (_logFileWatcher != null)
-            {
-                _logger.LogInformation("ReloadConfiguration: _logFileWatcher is NOT null. Attempting to call UpdateSettingsAsync.");
-                await _logFileWatcher.UpdateSettingsAsync(settingsToApply);
-                _logger.LogInformation("ReloadConfiguration: Call to _logFileWatcher.UpdateSettingsAsync completed.");
-                LogMessage("LogFileWatcher settings updated (local UI instance).");
-            }
-            else
+            if (_logFileWatcher == null)
             {
                 _logger.LogWarning("ReloadConfiguration: _logFileWatcher IS NULL. Cannot update local watcher.");
+                UpdateStatusBar("Configuration saved, but LogFileWatcher not available.");
+                return;
             }
 
-            LogMessage("Configuration reloaded and services notified (if applicable).");
-            UpdateStatusBar("Configuration saved and reloaded.");
+            _logger.LogInformation($"ReloadConfiguration: LogFileWatcher.IsProcessing BEFORE UpdateSettingsAsync: {_logFileWatcher.IsProcessing}");
+            _logger.LogInformation("ReloadConfiguration: Applying settings to LogFileWatcher via UpdateSettingsAsync.");
+            await _logFileWatcher.UpdateSettingsAsync(settingsToApply);
+            _logger.LogInformation("ReloadConfiguration: UpdateSettingsAsync completed.");
+            _logger.LogInformation($"ReloadConfiguration: LogFileWatcher.IsProcessing AFTER UpdateSettingsAsync: {_logFileWatcher.IsProcessing}");
 
-            // Regarding restarting processing after config change:
-            // LogFileWatcher.UpdateSettingsAsync already handles reprocessing existing files if dir changed while active.
-            // IF THE WATCHER IS ALREADY PROCESSING, UpdateSettingsAsync SHOULD HANDLE THE CHANGE.
-            // WE SHOULD NOT EXPLICITLY RESTART PROCESSING HERE AS IT'S CONFUSING BEHAVIOR.
-            _logger.LogDebug("ReloadConfiguration: Exiting method normally.");
+            bool isWatcherInContinuousProcessing = _logFileWatcher.IsProcessing;
+            _logger.LogInformation($"ReloadConfiguration: LogFileWatcher.IsProcessing (continuous state) after UpdateSettingsAsync: {isWatcherInContinuousProcessing}");
+
+            string statusMessage;
+
+            if (!wasLocalProcessingIntended)
+            {
+                _logger.LogInformation("ReloadConfiguration: Local processing was NOT intended.");
+                if (isWatcherInContinuousProcessing)
+                {
+                    _logger.LogInformation("ReloadConfiguration: Watcher is in continuous processing mode. Stopping it.");
+                    _logFileWatcher.UIManagedStopProcessing();
+                }
+                
+                _logger.LogInformation("ReloadConfiguration: Resetting position info to undo any unintended processing burst and ensure no progress is saved from it.");
+                _logFileWatcher.ResetPositionInfo(); // This is key to clear positions from any burst processing.
+
+                _isProcessing = false;
+                statusMessage = "Settings updated. Local processing stopped; positions reset to prevent saving unintended progress.";
+                LogMessage(statusMessage);
+                Dispatcher.Invoke(() =>
+                {
+                    ProcessingStatusText.Text = "Idle (Settings Updated)";
+                    StopPositionUpdateTimer();
+                });
+            }
+            else // wasLocalProcessingIntended is true
+            {
+                _logger.LogInformation("ReloadConfiguration: Local processing WAS intended.");
+                if (!isWatcherInContinuousProcessing)
+                {
+                    _logger.LogInformation("ReloadConfiguration: Watcher is not in continuous processing mode. Attempting to start it via UIManagedStartProcessingAsync.");
+                    await _logFileWatcher.UIManagedStartProcessingAsync(); 
+                    isWatcherInContinuousProcessing = _logFileWatcher.IsProcessing; // Re-check state after start attempt
+                }
+
+                _isProcessing = isWatcherInContinuousProcessing;
+                if (_isProcessing)
+                {
+                    statusMessage = "Settings updated. Local processing is active.";
+                    LogMessage(statusMessage);
+                    Dispatcher.Invoke(() =>
+                    {
+                        ProcessingStatusText.Text = "Running (Settings Updated)";
+                        if (_positionUpdateTimer == null) StartPositionUpdateTimer();
+                    });
+                }
+                else
+                {
+                    statusMessage = "Settings updated. Local processing was intended but failed to start/remain active.";
+                    LogError(statusMessage); // Log as error or warning
+                    Dispatcher.Invoke(() =>
+                    {
+                        ProcessingStatusText.Text = "Idle (Failed to Start)";
+                        StopPositionUpdateTimer();
+                    });
+                }
+            }
+            
+            // Always refresh button states based on the final _isProcessing and service status
+            Dispatcher.Invoke(UpdateServiceControlUi); 
+
+            UpdateStatusBar("Configuration saved and reloaded.");
+            _logger.LogDebug($"ReloadConfiguration: Exiting method normally. Final _isProcessing state: {_isProcessing}");
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "ReloadConfiguration: CAUGHT EXCEPTION."); 
             LogError($"Error reloading configuration: {ex.Message}");
             UpdateStatusBar($"Error reloading config: {ex.Message}");
+            // Attempt to restore a consistent UI state on error
+            Dispatcher.Invoke(() =>
+            {
+                _isProcessing = _logFileWatcher?.IsProcessing ?? false;
+                ProcessingStatusText.Text = _isProcessing ? "Error - Still Running?" : "Error - Stopped";
+                UpdateServiceControlUi();
+                if (!_isProcessing) StopPositionUpdateTimer();
+                else if (wasLocalProcessingIntended && _positionUpdateTimer == null && _isProcessing) StartPositionUpdateTimer();
+            });
         }
     }
     
@@ -1268,32 +1644,18 @@ public partial class MainWindow : Window
 
     private async Task TestDatabaseConnection()
     {
-        LogMessage("Testing database connection...");
+        LogMessage("Testing database connection (using current application settings)...");
         
-        // Create a temporary database settings object with the current UI values
-        var settings = new DatabaseSettings
+        if (_postgresService == null)
         {
-            Host = DbHost.Text,
-            Port = DbPort.Text,
-            Username = DbUsername.Text,
-            Password = DbPassword.Password,
-            Database = DbName.Text,
-            Schema = DbSchema.Text,
-            Table = DbTable.Text,
-            ConnectionTimeout = int.Parse(DbTimeout.Text)
-        };
+            LogError("PostgresService is not available. Cannot test connection.");
+            UpdateStatusBar("Database connection test failed: SERVICE NOT AVAILABLE");
+            DbStatusText.Text = "Error";
+            return;
+        }
         
-        // DEBUG ONLY - Log the password in cleartext - REMOVE IN PRODUCTION
-        _logger.LogWarning("DEBUG PURPOSE ONLY - MainWindow test using password: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", settings.Password);
-        LogWarning($"DEBUG PURPOSE ONLY - Testing with password: '{settings.Password}' [REMOVE THIS LOG]");
-        
-        // Create a test service with these settings
-        var logger = ((App)System.Windows.Application.Current).GetService<ILoggerFactory>().CreateLogger<PostgresService>();
-        var options = Options.Create(settings);
-        var dbService = new PostgresService(logger, options);
-        
-        // Test the connection
-        bool result = await dbService.TestConnectionAsync();
+        // Test the connection using the injected _postgresService
+        bool result = await _postgresService.TestConnectionAsync();
         
         if (result)
         {
@@ -1348,28 +1710,17 @@ public partial class MainWindow : Window
 
     private async Task VerifyDatabaseTable()
     {
-        LogMessage("Verifying database table...");
+        LogMessage("Verifying database table (using current application settings)...");
         
-        // Create a temporary database settings object with the current UI values
-        var settings = new DatabaseSettings
+        if (_postgresService == null)
         {
-            Host = DbHost.Text,
-            Port = DbPort.Text,
-            Username = DbUsername.Text,
-            Password = DbPassword.Password,
-            Database = DbName.Text,
-            Schema = DbSchema.Text,
-            Table = DbTable.Text,
-            ConnectionTimeout = int.Parse(DbTimeout.Text)
-        };
+            LogError("PostgresService is not available. Cannot verify table.");
+            UpdateStatusBar("Database table verification failed: SERVICE NOT AVAILABLE");
+            return;
+        }
         
-        // Create a test service with these settings
-        var logger = ((App)System.Windows.Application.Current).GetService<ILoggerFactory>().CreateLogger<PostgresService>();
-        var options = Options.Create(settings);
-        var dbService = new PostgresService(logger, options);
-        
-        // Test the connection first
-        bool connected = await dbService.TestConnectionAsync();
+        // Test the connection first using the injected _postgresService
+        bool connected = await _postgresService.TestConnectionAsync();
         
         if (!connected)
         {
@@ -1378,19 +1729,22 @@ public partial class MainWindow : Window
             return;
         }
         
+        // Get current settings for messages, etc.
+        var currentSettings = ((App)System.Windows.Application.Current).GetService<IOptionsMonitor<DatabaseSettings>>().CurrentValue;
+
         // First check if the table exists at all
-        bool tableExists = await dbService.TableExistsAsync();
+        bool tableExists = await _postgresService.TableExistsAsync();
         
         if (!tableExists)
         {
             // Table doesn't exist - ask if it should be created
-            var result = System.Windows.MessageBox.Show(
-                $"Table {settings.Schema}.{settings.Table} does not exist. Would you like to create it?",
+            var dr = System.Windows.MessageBox.Show(
+                $"Table {currentSettings.Schema}.{currentSettings.Table} does not exist. Would you like to create it?",
                 "Create Table",
                 MessageBoxButton.YesNo,
                 MessageBoxImage.Question);
                 
-            if (result != MessageBoxResult.Yes)
+            if (dr != MessageBoxResult.Yes)
             {
                 LogMessage("Table creation cancelled by user");
                 UpdateStatusBar("Table creation cancelled");
@@ -1398,15 +1752,15 @@ public partial class MainWindow : Window
             }
             
             // User confirmed to create the table
-            bool createResult = await dbService.CreateTableAsync();
+            bool createResult = await _postgresService.CreateTableAsync();
             if (createResult)
             {
-                LogMessage($"Table {settings.Schema}.{settings.Table} created successfully!");
+                LogMessage($"Table {currentSettings.Schema}.{currentSettings.Table} created successfully!");
                 UpdateStatusBar("Database table created: SUCCESS");
             }
             else
             {
-                LogError($"Failed to create table {settings.Schema}.{settings.Table}!");
+                LogError($"Failed to create table {currentSettings.Schema}.{currentSettings.Table}!");
                 UpdateStatusBar("Database table creation failed: ERROR");
                 return;
             }
@@ -1414,18 +1768,18 @@ public partial class MainWindow : Window
         else
         {
             // Table exists - check if structure matches
-            bool structureMatches = await dbService.ValidateTableStructureAsync();
+            bool structureMatches = await _postgresService.ValidateTableStructureAsync();
             
             if (!structureMatches)
             {
                 // Structure doesn't match - ask if it should be altered
-                var result = System.Windows.MessageBox.Show(
-                    $"Table {settings.Schema}.{settings.Table} exists but does not match the required structure.\n\nWould you like to drop and recreate the table?\n\nWARNING: This will delete all existing data in the table!",
+                var drStruct = System.Windows.MessageBox.Show(
+                    $"Table {currentSettings.Schema}.{currentSettings.Table} exists but does not match the required structure.\n\nWould you like to drop and recreate the table?\n\nWARNING: This will delete all existing data in the table!",
                     "Alter Table",
                     MessageBoxButton.YesNo,
                     MessageBoxImage.Warning);
                     
-                if (result != MessageBoxResult.Yes)
+                if (drStruct != MessageBoxResult.Yes)
                 {
                     LogWarning("Table structure is incorrect but user chose not to alter it");
                     UpdateStatusBar("Table structure mismatch: ACTION CANCELLED");
@@ -1433,36 +1787,36 @@ public partial class MainWindow : Window
                 }
                 
                 // User confirmed to alter the table
-                bool dropResult = await dbService.DropTableAsync();
+                bool dropResult = await _postgresService.DropTableAsync();
                 if (!dropResult)
                 {
-                    LogError($"Failed to drop table {settings.Schema}.{settings.Table}!");
+                    LogError($"Failed to drop table {currentSettings.Schema}.{currentSettings.Table}!");
                     UpdateStatusBar("Table alteration failed: DROP ERROR");
                     return;
                 }
                 
-                bool createResult = await dbService.CreateTableAsync();
+                bool createResult = await _postgresService.CreateTableAsync();
                 if (createResult)
                 {
-                    LogMessage($"Table {settings.Schema}.{settings.Table} recreated with correct structure!");
+                    LogMessage($"Table {currentSettings.Schema}.{currentSettings.Table} recreated with correct structure!");
                     UpdateStatusBar("Database table recreated: SUCCESS");
                 }
                 else
                 {
-                    LogError($"Failed to recreate table {settings.Schema}.{settings.Table}!");
+                    LogError($"Failed to recreate table {currentSettings.Schema}.{currentSettings.Table}!");
                     UpdateStatusBar("Table recreation failed: ERROR");
                     return;
                 }
             }
             else
             {
-                LogMessage($"Table {settings.Schema}.{settings.Table} exists and has the correct structure!");
+                LogMessage($"Table {currentSettings.Schema}.{currentSettings.Table} exists and has the correct structure!");
                 UpdateStatusBar("Database table verified: SUCCESS");
             }
         }
         
         // Check row count
-        long rowCount = await dbService.GetRowCountAsync();
+        long rowCount = await _postgresService.GetRowCountAsync();
         if (rowCount >= 0)
         {
             LogMessage($"Current row count: {rowCount}");
@@ -1486,7 +1840,9 @@ public partial class MainWindow : Window
         LogFilePattern.Text = "orfee-{Date:yyyy-MM-dd}.log";
         PollingInterval.Text = "5";
         
-        LogMessage("Settings reset to defaults");
+        LogMessage("Settings have been reset to default values.");
+        _hasUnsavedChanges = true; // Values have changed and are not saved yet
+        UpdateDbActionButtonsState(); // Update DB buttons based on reset settings
     }
 
     // Event handlers for the LogFileWatcher events
@@ -1734,6 +2090,14 @@ public partial class MainWindow : Window
     private async Task StartProcessingAsync()
     {
         _logger.LogInformation("Attempting to start local processing (UI managed)...");
+
+        if (_hasUnsavedChanges)
+        {
+            _logger.LogWarning("StartProcessingAsync: Aborted due to unsaved changes.");
+            System.Windows.MessageBox.Show("You have unsaved configuration changes. Please save them before starting processing.", "Unsaved Changes", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
         if (_logFileWatcher == null)
         {
             LogError("LogFileWatcher service is not available. Cannot start processing locally.");
@@ -1837,6 +2201,34 @@ public partial class MainWindow : Window
             }
         }
         // No direct call to UpdateServiceControlUi() here, it's called by the click handler after this returns.
+    }
+
+    // Method to update DB action buttons state
+    private void UpdateDbActionButtonsState()
+    {
+        bool canTestOrVerify = !string.IsNullOrWhiteSpace(DbHost.Text) &&
+                               !string.IsNullOrWhiteSpace(DbPort.Text) &&
+                               !string.IsNullOrWhiteSpace(DbUsername.Text) &&
+                               !string.IsNullOrWhiteSpace(DbName.Text);
+
+        TestConnectionBtn.IsEnabled = canTestOrVerify;
+        VerifyTableBtn.IsEnabled = canTestOrVerify;
+        // _logger?.LogDebug($"UpdateDbActionButtonsState: CanTestOrVerify = {canTestOrVerify}");
+    }
+
+    private void ConfigSetting_Changed(object sender, System.Windows.Controls.TextChangedEventArgs e)
+    {
+        _hasUnsavedChanges = true;
+        if (this.IsLoaded) // Check if the window is fully loaded
+        {
+            UpdateDbActionButtonsState(); // Update DB buttons as text change might be one of theirs
+        }
+    }
+
+    private void DbPassword_Changed(object sender, RoutedEventArgs e)
+    {
+        _hasUnsavedChanges = true;
+        // No need to call UpdateDbActionButtonsState here as password doesn't gate button enablement
     }
 
     #endregion

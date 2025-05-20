@@ -328,6 +328,10 @@ The WPF User Interface provides:
   - Self-contained deployment to eliminate external runtime dependencies
   - Support for different target platforms (x64, x86, ARM64 if necessary)
   - Minimal external dependencies requiring installation
+  - **Example Publish Command (for win-x64):**
+    ```bash
+    dotnet publish "Log2Postgres.csproj" -c Release -r win-x64 /p:PublishSingleFile=true /p:SelfContained=false /p:IncludeNativeLibrariesForSelfExtract=true --output "release/Log2Postgres_win-x64_framework_dependent_singlefile"
+    ```
 
 ### 🔐 Secure Windows Service Execution Context
 

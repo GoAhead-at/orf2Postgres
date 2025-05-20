@@ -15,45 +15,46 @@ namespace Log2Postgres.Core.Services
     public class PostgresService
     {
         private readonly ILogger<PostgresService> _logger;
-        private readonly DatabaseSettings _settings;
-        private string _connectionString = null!;
+        private readonly IOptionsMonitor<DatabaseSettings> _settingsMonitor;
 
-        public PostgresService(ILogger<PostgresService> logger, IOptions<DatabaseSettings> settings)
+        // Constructor for DI using IOptionsMonitor (preferred for general use)
+        public PostgresService(ILogger<PostgresService> logger, IOptionsMonitor<DatabaseSettings> settingsMonitor)
         {
             _logger = logger;
-            _settings = settings.Value;
+            _settingsMonitor = settingsMonitor;
             
-            // DEBUG ONLY - Log the password received from DI container - REMOVE IN PRODUCTION
-            _logger.LogWarning("DEBUG PURPOSE ONLY - PostgresService constructor received password: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", _settings.Password);
-            
-            BuildConnectionString();
+            _logger.LogWarning("DEBUG PURPOSE ONLY - PostgresService constructor (IOptionsMonitor) received initial password: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", _settingsMonitor.CurrentValue.Password);
         }
 
         /// <summary>
-        /// Builds the connection string from settings
+        /// Builds the connection string from current settings (respecting which constructor was used)
         /// </summary>
-        private void BuildConnectionString()
+        private string GetCurrentConnectionString()
         {
-            // Build the connection string based on settings
-            _logger.LogDebug("Building connection string with host: {Host}, port: {Port}, database: {Database}, username: {Username}", 
-                _settings.Host, _settings.Port, _settings.Database, _settings.Username);
-                
+            DatabaseSettings currentSettings = _settingsMonitor.CurrentValue;
+            _logger.LogInformation("GetCurrentConnectionString: Using DatabaseSettings - Host: {Host}, Port: {Port}, User: {Username}, DB: {Database}, Password IsNullOrEmpty: {PwdEmpty}, Timeout: {Timeout}", 
+                currentSettings.Host, 
+                currentSettings.Port, 
+                currentSettings.Username, 
+                currentSettings.Database,
+                string.IsNullOrEmpty(currentSettings.Password),
+                currentSettings.ConnectionTimeout);
+            
             // DEBUG ONLY - Log the password in cleartext - REMOVE IN PRODUCTION
-            _logger.LogWarning("DEBUG PURPOSE ONLY - Password being used: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", _settings.Password);
+            _logger.LogWarning("DEBUG PURPOSE ONLY - Password being used for current connection string: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", currentSettings.Password);
                 
             var builder = new NpgsqlConnectionStringBuilder
             {
-                Host = _settings.Host,
-                Port = int.Parse(_settings.Port),
-                Database = _settings.Database,
-                Username = _settings.Username,
-                Password = _settings.Password,
-                CommandTimeout = _settings.ConnectionTimeout,
-                Timeout = _settings.ConnectionTimeout
+                Host = currentSettings.Host,
+                Port = int.Parse(currentSettings.Port), // Consider TryParse for robustness
+                Database = currentSettings.Database,
+                Username = currentSettings.Username,
+                Password = currentSettings.Password,
+                CommandTimeout = currentSettings.ConnectionTimeout,
+                Timeout = currentSettings.ConnectionTimeout
             };
 
-            _connectionString = builder.ToString();
-            _logger.LogDebug("Connection string built successfully");
+            return builder.ToString();
         }
 
         /// <summary>
@@ -61,16 +62,17 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         public async Task<bool> TestConnectionAsync()
         {
+            var (currentSettings, connectionString) = GetSettingsAndConnectionString();
             try
             {
-                _logger.LogInformation("Testing database connection to {Host}:{Port}", _settings.Host, _settings.Port);
+                _logger.LogInformation("Testing database connection to {Host}:{Port}", currentSettings.Host, currentSettings.Port);
                 _logger.LogDebug("Connection details - Database: {Database}, Username: {Username}, Timeout: {Timeout}s", 
-                    _settings.Database, _settings.Username, _settings.ConnectionTimeout);
+                    currentSettings.Database, currentSettings.Username, currentSettings.ConnectionTimeout);
                 
                 // DEBUG ONLY - Log the password in cleartext - REMOVE IN PRODUCTION
-                _logger.LogWarning("DEBUG PURPOSE ONLY - Password being used for connection test: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", _settings.Password);
+                _logger.LogWarning("DEBUG PURPOSE ONLY - Password being used for connection test: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", currentSettings.Password);
                 
-                using var connection = new NpgsqlConnection(_connectionString);
+                using var connection = new NpgsqlConnection(connectionString);
                 _logger.LogDebug("Opening database connection...");
                 await connection.OpenAsync();
                 _logger.LogInformation("Database connection test successful");
@@ -88,21 +90,26 @@ namespace Log2Postgres.Core.Services
                     {
                         errorMessage = "Authentication failed. Check your username and password.";
                         // DEBUG ONLY - Log the password in cleartext - REMOVE IN PRODUCTION
-                        _logger.LogWarning("DEBUG PURPOSE ONLY - Failed authentication with password: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", _settings.Password);
+                        _logger.LogWarning("DEBUG PURPOSE ONLY - Failed authentication with password: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", currentSettings.Password);
                     }
                     else if (pgEx.SqlState == "3D000") // Database does not exist
                     {
-                        errorMessage = $"Database '{_settings.Database}' does not exist.";
+                        errorMessage = $"Database '{currentSettings.Database}' does not exist.";
                     }
                     else if (pgEx.SqlState == "08001" || pgEx.SqlState == "08006") // Connection error
                     {
-                        errorMessage = $"Could not connect to database server at {_settings.Host}:{_settings.Port}.";
+                        errorMessage = $"Could not connect to database server at {currentSettings.Host}:{currentSettings.Port}.";
                     }
                 }
                 
                 _logger.LogError(ex, "Database connection test failed: {Message}", errorMessage);
-                _logger.LogDebug("Connection string used: {ConnectionString}", 
-                    _connectionString.Replace(_settings.Password, "********"));
+
+                string connectionStringToLog = connectionString;
+                if (!string.IsNullOrEmpty(currentSettings.Password))
+                {
+                    connectionStringToLog = connectionString.Replace(currentSettings.Password, "********");
+                }
+                _logger.LogDebug("Connection string used (password redacted): {ConnectionString}", connectionStringToLog);
                 return false;
             }
         }
@@ -112,15 +119,16 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         public async Task<bool> EnsureTableExistsAsync()
         {
+            var (currentSettings, _) = GetSettingsAndConnectionString();
             try
             {
-                _logger.LogInformation("Ensuring table {Schema}.{Table} exists", _settings.Schema, _settings.Table);
+                _logger.LogInformation("Ensuring table {Schema}.{Table} exists", currentSettings.Schema, currentSettings.Table);
                 
                 // Check if table exists
                 bool tableExists = await CheckTableExistsAsync();
                 if (tableExists)
                 {
-                    _logger.LogInformation("Table {Schema}.{Table} already exists", _settings.Schema, _settings.Table);
+                    _logger.LogInformation("Table {Schema}.{Table} already exists", currentSettings.Schema, currentSettings.Table);
                     return true;
                 }
 
@@ -142,7 +150,8 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         private async Task<bool> CheckTableExistsAsync()
         {
-            using var connection = new NpgsqlConnection(_connectionString);
+            var (currentSettings, connectionString) = GetSettingsAndConnectionString();
+            using var connection = new NpgsqlConnection(connectionString);
             await connection.OpenAsync();
             
             string sql = @"
@@ -153,8 +162,8 @@ namespace Log2Postgres.Core.Services
                 );";
             
             using var cmd = new NpgsqlCommand(sql, connection);
-            cmd.Parameters.AddWithValue("schema", _settings.Schema);
-            cmd.Parameters.AddWithValue("table", _settings.Table);
+            cmd.Parameters.AddWithValue("schema", currentSettings.Schema);
+            cmd.Parameters.AddWithValue("table", currentSettings.Table);
             
             return (bool?)await cmd.ExecuteScalarAsync() ?? false;
         }
@@ -172,15 +181,16 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         private async Task CreateSchemaIfNotExistsAsync()
         {
-            using var connection = new NpgsqlConnection(_connectionString);
+            var (currentSettings, connectionString) = GetSettingsAndConnectionString();
+            using var connection = new NpgsqlConnection(connectionString);
             await connection.OpenAsync();
             
-            string sql = $"CREATE SCHEMA IF NOT EXISTS {_settings.Schema};";
+            string sql = $"CREATE SCHEMA IF NOT EXISTS {currentSettings.Schema};"; // Use currentSettings
             
             using var cmd = new NpgsqlCommand(sql, connection);
             await cmd.ExecuteNonQueryAsync();
             
-            _logger.LogInformation("Created schema {Schema} if it didn't exist", _settings.Schema);
+            _logger.LogInformation("Created schema {Schema} if it didn't exist", currentSettings.Schema);
         }
 
         /// <summary>
@@ -188,16 +198,17 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         public async Task<bool> CreateTableAsync()
         {
+            var (currentSettings, connectionString) = GetSettingsAndConnectionString();
             try
             {
                 // Create schema if needed
-                await CreateSchemaIfNotExistsAsync();
+                await CreateSchemaIfNotExistsAsync(); // This will use current settings internally
                 
-                using var connection = new NpgsqlConnection(_connectionString);
+                using var connection = new NpgsqlConnection(connectionString);
                 await connection.OpenAsync();
                 
                 string sql = $@"
-                    CREATE TABLE {_settings.Schema}.{_settings.Table} (
+                    CREATE TABLE {currentSettings.Schema}.{currentSettings.Table} (
                       message_id TEXT PRIMARY KEY,
                       event_source TEXT,
                       event_datetime TIMESTAMPTZ,
@@ -221,7 +232,7 @@ namespace Log2Postgres.Core.Services
                 using var cmd = new NpgsqlCommand(sql, connection);
                 await cmd.ExecuteNonQueryAsync();
                 
-                _logger.LogInformation("Table {Schema}.{Table} created successfully", _settings.Schema, _settings.Table);
+                _logger.LogInformation("Table {Schema}.{Table} created successfully", currentSettings.Schema, currentSettings.Table);
                 return true;
             }
             catch (Exception ex)
@@ -238,7 +249,9 @@ namespace Log2Postgres.Core.Services
         {
             try
             {
-                using var connection = new NpgsqlConnection(_connectionString);
+                string connectionString = GetCurrentConnectionString();
+                var currentSettings = _settingsMonitor.CurrentValue;
+                using var connection = new NpgsqlConnection(connectionString);
                 await connection.OpenAsync();
                 
                 // Query to get table columns
@@ -250,8 +263,8 @@ namespace Log2Postgres.Core.Services
                     ORDER BY ordinal_position;";
                 
                 using var cmd = new NpgsqlCommand(sql, connection);
-                cmd.Parameters.AddWithValue("schema", _settings.Schema);
-                cmd.Parameters.AddWithValue("table", _settings.Table);
+                cmd.Parameters.AddWithValue("schema", currentSettings.Schema);
+                cmd.Parameters.AddWithValue("table", currentSettings.Table);
                 
                 using var reader = await cmd.ExecuteReaderAsync();
                 
@@ -333,7 +346,9 @@ namespace Log2Postgres.Core.Services
         {
             try
             {
-                using var connection = new NpgsqlConnection(_connectionString);
+                string connectionString = GetCurrentConnectionString();
+                var currentSettings = _settingsMonitor.CurrentValue;
+                using var connection = new NpgsqlConnection(connectionString);
                 await connection.OpenAsync();
                 
                 string sql = @"
@@ -344,8 +359,8 @@ namespace Log2Postgres.Core.Services
                     AND i.indisprimary;";
                 
                 using var cmd = new NpgsqlCommand(sql, connection);
-                cmd.Parameters.AddWithValue("schema", _settings.Schema);
-                cmd.Parameters.AddWithValue("table", _settings.Table);
+                cmd.Parameters.AddWithValue("schema", currentSettings.Schema);
+                cmd.Parameters.AddWithValue("table", currentSettings.Table);
                 
                 using var reader = await cmd.ExecuteReaderAsync();
                 
@@ -382,15 +397,16 @@ namespace Log2Postgres.Core.Services
         {
             try
             {
-                using var connection = new NpgsqlConnection(_connectionString);
+                var (currentSettings, connectionString) = GetSettingsAndConnectionString();
+                using var connection = new NpgsqlConnection(connectionString);
                 await connection.OpenAsync();
                 
-                string sql = $"DROP TABLE IF EXISTS {_settings.Schema}.{_settings.Table};";
+                string sql = $"DROP TABLE IF EXISTS {currentSettings.Schema}.{currentSettings.Table};";
                 
                 using var cmd = new NpgsqlCommand(sql, connection);
                 await cmd.ExecuteNonQueryAsync();
                 
-                _logger.LogInformation("Table {Schema}.{Table} dropped successfully", _settings.Schema, _settings.Table);
+                _logger.LogInformation("Table {Schema}.{Table} dropped successfully", currentSettings.Schema, currentSettings.Table);
                 return true;
             }
             catch (Exception ex)
@@ -405,106 +421,79 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         public async Task<int> SaveEntriesAsync(IEnumerable<OrfLogEntry> entries, CancellationToken cancellationToken)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var entriesList = entries.ToList();
-            _logger.LogDebug("Attempting to save {Count} log entries to database", entriesList.Count);
+            int savedCount = 0;
+            var (currentSettings, connectionString) = GetSettingsAndConnectionString();
+
+            _logger.LogDebug("Attempting to save {Count} entries to {Schema}.{Table}", 
+                entries.Count(), currentSettings.Schema, currentSettings.Table);
             
             try
             {
-                using var connection = new NpgsqlConnection(_connectionString);
-                _logger.LogDebug("Opening database connection for batch insert");
+                await using var connection = new NpgsqlConnection(connectionString);
                 await connection.OpenAsync(cancellationToken);
-                
-                int count = 0;
-                using (var transaction = await connection.BeginTransactionAsync(cancellationToken))
+                _logger.LogDebug("Database connection opened for saving entries.");
+
+                foreach (var entry in entries)
                 {
-                    _logger.LogDebug("Transaction started for batch insert");
+                    cancellationToken.ThrowIfCancellationRequested();
                     try
                     {
-                        foreach (var entry in entriesList)
-                        {
-                            cancellationToken.ThrowIfCancellationRequested();
-                            // Skip system messages (no message ID)
-                            if (entry.IsSystemMessage)
-                            {
-                                _logger.LogTrace("Skipping system message entry");
-                                continue;
-                            }
-                            
-                            _logger.LogTrace("Processing entry with ID: {MessageId}, Date: {Date}", 
-                                entry.MessageId, entry.EventDateTime);
-                            
-                            string sql = $@"
-                                INSERT INTO {_settings.Schema}.{_settings.Table} (
-                                    message_id, event_source, event_datetime, event_class, 
-                                    event_severity, event_action, filtering_point, ip, 
-                                    sender, recipients, msg_subject, msg_author, 
-                                    remote_peer, source_ip, country, event_msg, filename, processed_at
-                                ) VALUES (
-                                    @message_id, @event_source, @event_datetime, @event_class,
-                                    @event_severity, @event_action, @filtering_point, @ip,
-                                    @sender, @recipients, @msg_subject, @msg_author,
-                                    @remote_peer, @source_ip, @country, @event_msg, @filename, @processed_at
-                                )
-                                ON CONFLICT (message_id) DO NOTHING;";
-                            
-                            using var cmd = new NpgsqlCommand(sql, connection, transaction as NpgsqlTransaction);
-                            cmd.Parameters.AddWithValue("message_id", entry.MessageId);
-                            cmd.Parameters.AddWithValue("event_source", entry.EventSource);
-                            cmd.Parameters.AddWithValue("event_datetime", entry.EventDateTime);
-                            cmd.Parameters.AddWithValue("event_class", entry.EventClass);
-                            cmd.Parameters.AddWithValue("event_severity", entry.EventSeverity);
-                            cmd.Parameters.AddWithValue("event_action", entry.EventAction);
-                            cmd.Parameters.AddWithValue("filtering_point", entry.FilteringPoint);
-                            cmd.Parameters.AddWithValue("ip", entry.IP);
-                            cmd.Parameters.AddWithValue("sender", entry.Sender);
-                            cmd.Parameters.AddWithValue("recipients", entry.Recipients);
-                            cmd.Parameters.AddWithValue("msg_subject", entry.MsgSubject);
-                            cmd.Parameters.AddWithValue("msg_author", entry.MsgAuthor);
-                            cmd.Parameters.AddWithValue("remote_peer", entry.RemotePeer);
-                            cmd.Parameters.AddWithValue("source_ip", entry.SourceIP);
-                            cmd.Parameters.AddWithValue("country", entry.Country);
-                            cmd.Parameters.AddWithValue("event_msg", entry.EventMsg);
-                            cmd.Parameters.AddWithValue("filename", entry.SourceFilename);
-                            cmd.Parameters.AddWithValue("processed_at", entry.ProcessedAt);
-                            
-                            await cmd.ExecuteNonQueryAsync(cancellationToken);
-                            count++;
-                            
-                            if (count % 100 == 0)
-                            {
-                                _logger.LogDebug("Inserted {Count} entries so far", count);
-                            }
-                        }
-                        
-                        _logger.LogDebug("Committing transaction with {Count} entries", count);
-                        await transaction.CommitAsync(cancellationToken);
-                        _logger.LogInformation("Saved {Count} log entries to database", count);
+                        await using var cmd = new NpgsqlCommand($@"
+                        INSERT INTO {currentSettings.Schema}.{currentSettings.Table} 
+                        (message_id, event_source, event_datetime, event_class, 
+                        event_severity, event_action, filtering_point, ip, 
+                        sender, recipients, msg_subject, msg_author, 
+                        remote_peer, source_ip, country, event_msg, filename, processed_at)
+                        VALUES (@message_id, @event_source, @event_datetime, @event_class,
+                        @event_severity, @event_action, @filtering_point, @ip,
+                        @sender, @recipients, @msg_subject, @msg_author,
+                        @remote_peer, @source_ip, @country, @event_msg, @filename, @processed_at)
+                        ON CONFLICT (message_id) DO NOTHING;", connection);
+
+                        cmd.Parameters.AddWithValue("message_id", entry.MessageId);
+                        cmd.Parameters.AddWithValue("event_source", entry.EventSource);
+                        cmd.Parameters.AddWithValue("event_datetime", entry.EventDateTime);
+                        cmd.Parameters.AddWithValue("event_class", entry.EventClass);
+                        cmd.Parameters.AddWithValue("event_severity", entry.EventSeverity);
+                        cmd.Parameters.AddWithValue("event_action", entry.EventAction);
+                        cmd.Parameters.AddWithValue("filtering_point", entry.FilteringPoint);
+                        cmd.Parameters.AddWithValue("ip", entry.IP);
+                        cmd.Parameters.AddWithValue("sender", entry.Sender);
+                        cmd.Parameters.AddWithValue("recipients", entry.Recipients);
+                        cmd.Parameters.AddWithValue("msg_subject", entry.MsgSubject);
+                        cmd.Parameters.AddWithValue("msg_author", entry.MsgAuthor);
+                        cmd.Parameters.AddWithValue("remote_peer", entry.RemotePeer);
+                        cmd.Parameters.AddWithValue("source_ip", entry.SourceIP);
+                        cmd.Parameters.AddWithValue("country", entry.Country);
+                        cmd.Parameters.AddWithValue("event_msg", entry.EventMsg);
+                        cmd.Parameters.AddWithValue("filename", entry.SourceFilename);
+                        cmd.Parameters.AddWithValue("processed_at", entry.ProcessedAt);
+
+                        await cmd.ExecuteNonQueryAsync(cancellationToken);
+                        savedCount++;
                     }
-                    catch (OperationCanceledException) // Specifically catch OperationCanceledException
+                    catch (OperationCanceledException)
                     {
-                        _logger.LogInformation("SaveEntriesAsync was cancelled during transaction. Rolling back.");
-                        await transaction.RollbackAsync(CancellationToken.None); // Use CancellationToken.None for rollback if original token is already cancelled
-                        throw; // Re-throw the cancellation exception
+                        _logger.LogInformation("SaveEntriesAsync was cancelled during saving entries.");
+                        throw;
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogDebug("Error during batch insert, rolling back transaction");
-                        await transaction.RollbackAsync(CancellationToken.None); // Use CancellationToken.None for rollback
-                        throw new Exception($"Error saving entries, transaction rolled back: {ex.Message}", ex);
+                        _logger.LogError(ex, "Error saving entry: {Message}", ex.Message);
                     }
                 }
-                
-                return count;
+
+                _logger.LogInformation("Saved {Count} entries to {Schema}.{Table}", savedCount, currentSettings.Schema, currentSettings.Table);
+                return savedCount;
             }
-            catch (OperationCanceledException) // Catch OperationCanceledException if OpenAsync or BeginTransactionAsync is cancelled
+            catch (OperationCanceledException)
             {
-                _logger.LogInformation("SaveEntriesAsync was cancelled before or during transaction setup.");
-                throw; // Re-throw the cancellation exception
+                _logger.LogInformation("SaveEntriesAsync was cancelled before or during saving entries.");
+                throw;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error saving log entries to database: {Message}", ex.Message);
+                _logger.LogError(ex, "Error saving entries to database: {Message}", ex.Message);
                 return 0;
             }
         }
@@ -514,17 +503,15 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         public async Task<long> GetRowCountAsync()
         {
+            var (currentSettings, connectionString) = GetSettingsAndConnectionString();
             try
             {
-                using var connection = new NpgsqlConnection(_connectionString);
+                await using var connection = new NpgsqlConnection(connectionString);
                 await connection.OpenAsync();
                 
-                string sql = $"SELECT COUNT(*) FROM {_settings.Schema}.{_settings.Table};";
-                
-                using var cmd = new NpgsqlCommand(sql, connection);
-                var result = await cmd.ExecuteScalarAsync();
-                
-                return Convert.ToInt64(result);
+                await using var cmd = new NpgsqlCommand($"SELECT COUNT(*) FROM {currentSettings.Schema}.{currentSettings.Table}", connection);
+                object? result = await cmd.ExecuteScalarAsync();
+                return result is DBNull ? 0 : Convert.ToInt64(result);
             }
             catch (Exception ex)
             {
@@ -539,10 +526,12 @@ namespace Log2Postgres.Core.Services
         public async Task<List<OrfLogEntry>> GetSampleDataAsync(int limit = 100)
         {
             var entries = new List<OrfLogEntry>();
+            var (currentSettings, connectionString) = GetSettingsAndConnectionString();
+
             try
             {
-                _logger.LogDebug("Fetching up to {Limit} sample log entries from {Schema}.{Table}", limit, _settings.Schema, _settings.Table);
-                using var connection = new NpgsqlConnection(_connectionString);
+                _logger.LogDebug("Fetching up to {Limit} sample log entries from {Schema}.{Table}", limit, currentSettings.Schema, currentSettings.Table);
+                await using var connection = new NpgsqlConnection(connectionString);
                 await connection.OpenAsync();
                 
                 string sql = $@"
@@ -551,14 +540,14 @@ namespace Log2Postgres.Core.Services
                         event_action, filtering_point, ip, sender, recipients, 
                         msg_subject, msg_author, remote_peer, source_ip, country, 
                         event_msg, filename, processed_at
-                    FROM {_settings.Schema}.{_settings.Table}
+                    FROM {currentSettings.Schema}.{currentSettings.Table}
                     ORDER BY event_datetime DESC
                     LIMIT @limit;";
                 
-                using var cmd = new NpgsqlCommand(sql, connection);
+                await using var cmd = new NpgsqlCommand(sql, connection);
                 cmd.Parameters.AddWithValue("limit", limit);
                 
-                using var reader = await cmd.ExecuteReaderAsync();
+                await using var reader = await cmd.ExecuteReaderAsync();
                 while (await reader.ReadAsync())
                 {
                     var entry = new OrfLogEntry
@@ -591,6 +580,39 @@ namespace Log2Postgres.Core.Services
                 _logger.LogError(ex, "Error getting sample data: {Message}", ex.Message);
             }
             return entries;
+        }
+
+        // Helper method to get current settings and connection string based on initialization path
+        private (DatabaseSettings settings, string connectionString) GetSettingsAndConnectionString()
+        {
+            DatabaseSettings currentSettings = _settingsMonitor.CurrentValue;
+            // More detailed logging for diagnosing configuration update issues
+            _logger.LogInformation("GetSettingsAndConnectionString: Using DatabaseSettings - Host: {Host}, Port: {Port}, User: {Username}, DB: {Database}, Password IsNullOrEmpty: {PwdEmpty}, Timeout: {Timeout}", 
+                currentSettings.Host, 
+                currentSettings.Port, 
+                currentSettings.Username, 
+                currentSettings.Database,
+                string.IsNullOrEmpty(currentSettings.Password),
+                currentSettings.ConnectionTimeout);
+
+            // Build connection string from these settings
+            var builder = new NpgsqlConnectionStringBuilder
+            {
+                Host = currentSettings.Host,
+                Port = int.TryParse(currentSettings.Port, out int port) ? port : 5432, // Use TryParse with default
+                Database = currentSettings.Database,
+                Username = currentSettings.Username,
+                Password = currentSettings.Password,
+                CommandTimeout = currentSettings.ConnectionTimeout,
+                Timeout = currentSettings.ConnectionTimeout
+            };
+            string connectionString = builder.ToString();
+
+            _logger.LogDebug("Using settings - host: {Host}, port: {Port}, db: {Db}, user: {User}. ConnString built.", 
+                currentSettings.Host, currentSettings.Port, currentSettings.Database, currentSettings.Username);
+            _logger.LogWarning("DEBUG PURPOSE ONLY - Password for this operation: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", currentSettings.Password);
+
+            return (currentSettings, connectionString);
         }
     }
 

@@ -53,28 +53,28 @@
                         <Expander Header="Database Connection" IsExpanded="True" Margin="0,0,0,10">
                             <StackPanel Margin="5">
                                 <TextBlock Text="Host / Server:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbHost" Margin="0,0,0,5"/>
+                                <TextBox x:Name="DbHost" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Port:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbPort" Text="5432" Margin="0,0,0,5"/>
+                                <TextBox x:Name="DbPort" Text="5432" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Username:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbUsername" Margin="0,0,0,5"/>
+                                <TextBox x:Name="DbUsername" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Password:" Margin="0,5,0,2"/>
-                                <PasswordBox x:Name="DbPassword" Margin="0,0,0,5"/>
+                                <PasswordBox x:Name="DbPassword" Margin="0,0,0,5" PasswordChanged="DbPassword_Changed"/>
                                 
                                 <TextBlock Text="Database Name:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbName" Text="postgres" Margin="0,0,0,5"/>
+                                <TextBox x:Name="DbName" Text="postgres" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Schema:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbSchema" Text="public" Margin="0,0,0,5"/>
+                                <TextBox x:Name="DbSchema" Text="public" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Table Name:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbTable" Text="orf_logs" Margin="0,0,0,5"/>
+                                <TextBox x:Name="DbTable" Text="orf_logs" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Connection Timeout (seconds):" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbTimeout" Text="30" Margin="0,0,0,10"/>
+                                <TextBox x:Name="DbTimeout" Text="30" Margin="0,0,0,10" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <Button x:Name="TestConnectionBtn" Content="Test Connection" Style="{StaticResource MaterialDesignOutlinedButton}" 
                                         Margin="0,5,0,5" Click="TestConnectionBtn_Click"/>
@@ -92,17 +92,17 @@
                                         <ColumnDefinition Width="*"/>
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
-                                    <TextBox x:Name="LogDirectory" Grid.Column="0" Margin="0,0,5,0"/>
+                                    <TextBox x:Name="LogDirectory" Grid.Column="0" Margin="0,0,5,0" TextChanged="ConfigSetting_Changed"/>
                                     <Button x:Name="BrowseBtn" Grid.Column="1" Style="{StaticResource MaterialDesignFlatButton}" 
                                             Content="Browse" Margin="0" Click="BrowseBtn_Click"/>
                                 </Grid>
                                 
                                 <TextBlock Text="Log File Pattern:" Margin="0,10,0,2"/>
-                                <TextBox x:Name="LogFilePattern" Text="orfee-{Date:yyyy-MM-dd}.log" Margin="0,0,0,2"/>
+                                <TextBox x:Name="LogFilePattern" Text="orfee-{Date:yyyy-MM-dd}.log" Margin="0,0,0,2" TextChanged="ConfigSetting_Changed"/>
                                 <TextBlock Text="Use {Date:format} to specify date patterns" FontStyle="Italic" FontSize="11" Margin="0,0,0,10"/>
                                 
                                 <TextBlock Text="Polling Interval (seconds):" Margin="0,5,0,2"/>
-                                <TextBox x:Name="PollingInterval" Text="5" Margin="0,0,0,10"/>
+                                <TextBox x:Name="PollingInterval" Text="5" Margin="0,0,0,10" TextChanged="ConfigSetting_Changed"/>
                             </StackPanel>
                         </Expander>
                         

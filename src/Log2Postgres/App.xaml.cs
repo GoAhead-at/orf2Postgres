@@ -14,6 +14,9 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Log2Postgres.Core.Models;
 using System.Security.Principal; // For WindowsIdentity
+using Serilog.Settings.Configuration;
+// using Serilog.Sinks.Console; // Removed - suspected cause of CS0234
+// using Serilog.Sinks.File;   // Removed - suspected cause of CS0234
 
 namespace Log2Postgres
 {
@@ -22,7 +25,7 @@ namespace Log2Postgres
     /// </summary>
     public partial class App : System.Windows.Application
     {
-        private IHost? _host;
+        private IHost _host;
         private static Mutex _singleInstanceMutex = null!;
         private const string MutexName = "Log2PostgresAppSingleInstance";
         
@@ -35,104 +38,55 @@ namespace Log2Postgres
         
         private const int SW_RESTORE = 9;
 
+        public App(IHost host)
+        {
+            _host = host ?? throw new ArgumentNullException(nameof(host));
+            InitializeGlobalErrorHandling();
+        }
+
         public App()
         {
-            // If not installing/uninstalling (checked by Program.Main), proceed with normal application startup
+            InitializeGlobalErrorHandling();
+            Console.WriteLine("[App..ctor] Parameterless constructor called. Building its own host.");
+            _host = CreateHostBuilder(Environment.GetCommandLineArgs()).Build();
+        }
+
+        private void InitializeGlobalErrorHandling()
+        {
             try
             {
-                // Check for startup error file from previous runs
-                string errorFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "startup_error.txt");
-                if (File.Exists(errorFilePath))
-                {
-                    try
-                    {
-                        string errorContent = File.ReadAllText(errorFilePath);
-                        System.Windows.MessageBox.Show(
-                            $"A previous startup error was detected:\n\n{errorContent.Substring(0, Math.Min(500, errorContent.Length))}...\n\nThis file will be renamed to startup_error.old.txt",
-                            "Previous Startup Error",
-                            MessageBoxButton.OK,
-                            MessageBoxImage.Warning);
-                            
-                        // Rename the file so it doesn't show up next time
-                        if (File.Exists(errorFilePath + ".old"))
-                            File.Delete(errorFilePath + ".old");
-                            
-                        File.Move(errorFilePath, errorFilePath + ".old");
-                    }
-                    catch
-                    {
-                        // Ignore errors in displaying previous error file
-                    }
-                }
+                File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "App_Constructor_Start.txt"), $"App constructor/init called at {DateTime.Now}\\nAppCcontext.BaseDirectory: {AppContext.BaseDirectory}");
+            }
+            catch { /* ignore */ }
 
-                // Check if another instance is already running
-                bool createdNew;
-                _singleInstanceMutex = new Mutex(true, MutexName, out createdNew);
-                
-                if (!createdNew)
+            var selfLogFilePath = Path.Combine(AppContext.BaseDirectory, "Log2Postgres_Serilog_SelfLog_AppDir.txt");
+            Serilog.Debugging.SelfLog.Enable(msg => 
+            {
+                try 
                 {
-                    // Another instance is already running - find it and activate it
-                    ActivateExistingInstance();
-                    
-                    // Shut down this instance
-                    Shutdown();
-                    return;
+                    File.AppendAllText(selfLogFilePath, $"[{DateTime.Now:o}] {msg}{Environment.NewLine}");
                 }
-                
-                // We're the first instance, so create the host
+                catch 
+                {
+                    Console.Error.WriteLine("[SelfLog-FileError] ({selfLogFilePath}): " + msg);
+                }
+            });
+
+            string errorFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "startup_error.txt");
+            if (File.Exists(errorFilePath))
+            {
                 try
                 {
-                    _host = CreateHostBuilder().Build();
+                    string errorContent = File.ReadAllText(errorFilePath);
+                    System.Windows.MessageBox.Show(
+                        $"A previous startup error was detected:\\n\\n{errorContent.Substring(0, Math.Min(500, errorContent.Length))}...\\n\\nThis file will be renamed to startup_error.old.txt",
+                        "Previous Startup Error",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Warning);
+                    if (File.Exists(errorFilePath + ".old")) File.Delete(errorFilePath + ".old");
+                    File.Move(errorFilePath, errorFilePath + ".old");
                 }
-                catch (Exception ex)
-                {
-                    // Log the error and continue without the host
-                    // If we can't create the host, we'll run with a simplified window
-                    
-                    // Show a minimal window instead of crashing
-                    Dispatcher.InvokeAsync(() => {
-                        try
-                        {
-                            // Create a simplified window for diagnostics
-                            var mainWindow = new Window
-                            {
-                                Title = "Log2Postgres - Error Window",
-                                Width = 800,
-                                Height = 600
-                            };
-                            
-                            // Add a label to show the error
-                            var textBlock = new System.Windows.Controls.TextBlock
-                            {
-                                Text = $"Error starting application:\n\n{ex.Message}",
-                                Margin = new Thickness(20),
-                                TextWrapping = TextWrapping.Wrap
-                            };
-                            
-                            mainWindow.Content = textBlock;
-                            
-                            // Show the window
-                            mainWindow.Show();
-                        }
-                        catch
-                        {
-                            // If we can't even show a window, just log and exit
-                            Shutdown();
-                        }
-                    });
-                }
-            }
-            catch (Exception ex)
-            {
-                // Log the error
-                 System.Windows.MessageBox.Show(
-                    $"Error in App constructor: {ex.Message}", 
-                    "App Constructor Error", 
-                    MessageBoxButton.OK, 
-                    MessageBoxImage.Error);
-                    
-                // Exit the application
-                Shutdown();
+                catch { /* Ignore */ }
             }
         }
         
@@ -140,24 +94,19 @@ namespace Log2Postgres
         {
             try
             {
-                // Find the existing process
                 var currentProcess = Process.GetCurrentProcess();
                 var processes = Process.GetProcessesByName(currentProcess.ProcessName);
                 
                 foreach (var process in processes)
                 {
-                    // Skip the current process
                     if (process.Id == currentProcess.Id)
                         continue;
                     
-                    // Ensure it's a process with a main window
                     if (process.MainWindowHandle != IntPtr.Zero)
                     {
-                        // Activate the window
                         ShowWindow(process.MainWindowHandle, SW_RESTORE);
                         SetForegroundWindow(process.MainWindowHandle);
                         
-                        // Log the action
                         Console.WriteLine($"Found existing instance (PID: {process.Id}), activating its window.");
                         break;
                     }
@@ -165,7 +114,6 @@ namespace Log2Postgres
             }
             catch (Exception ex)
             {
-                // Log but don't crash - worst case, we just start another instance
                 Console.WriteLine($"Error activating existing instance: {ex.Message}");
                 System.Windows.MessageBox.Show($"Another instance is already running, but couldn't be activated: {ex.Message}",
                     "Application Already Running", MessageBoxButton.OK, MessageBoxImage.Information);
@@ -192,24 +140,48 @@ namespace Log2Postgres
 
         public static IHostBuilder CreateHostBuilder(string[]? args = null)
         {
-            // Determine if running as a service.
+            // VERY EARLY DIAGNOSTIC LOGGING - BEFORE ANYTHING ELSE
+            string diagLogPath = Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt");
+            try
+            {
+                string initialArgs = (args == null) ? "null" : $"['{string.Join("','", args)}']";
+                string envArgsLine = "null";
+                try { envArgsLine = $"['{string.Join("','", Environment.GetCommandLineArgs())}']"; } catch {}
+                string userInteractiveLine = "unknown";
+                try { userInteractiveLine = Environment.UserInteractive.ToString(); } catch {}
+
+                File.AppendAllText(diagLogPath, 
+                    $"[{DateTime.Now:o}] CreateHostBuilder ENTERED.\n" +
+                    $"  Passed args: {initialArgs}\n" +
+                    $"  Environment.UserInteractive: {userInteractiveLine}\n" +
+                    $"  Environment.GetCommandLineArgs(): {envArgsLine}\n");
+            }
+            catch (Exception exDiag)
+            {
+                try { File.AppendAllText(diagLogPath, $"[{DateTime.Now:o}] ERROR writing diag log: {exDiag.Message}\n"); }
+                catch { /* utterly failed */ }
+            }
+
             var effectiveArgs = args ?? Environment.GetCommandLineArgs();
             string commandLineForLog = string.Join(" ", effectiveArgs);
 
-            // A Windows service runs non-interactively. The --windows-service argument is a strong indicator too.
-            // Environment.UserInteractive is true if the process is running in an interactive environment (e.g., user double-clicked).
-            // It's false when run by SCM (services.exe).
             bool isLaunchedBySCM = !Environment.UserInteractive;
             bool hasServiceArgument = effectiveArgs.Contains("--windows-service", StringComparer.OrdinalIgnoreCase);
             
-            // Consider it a service if either SCM launched it OR the specific argument is present.
-            // This provides flexibility for testing with the argument even in an interactive session.
             bool runAsService = isLaunchedBySCM || hasServiceArgument;
 
-            // CRITICAL DIAGNOSTIC LOGGING:
-            // Use a temporary logger here if the main one isn't set up yet, or write to a temp file.
-            // For simplicity, let's assume a simple Console.WriteLine will get picked up by service logs if redirected
-            // or at least be visible if testing service startup from command line.
+            // Log determination factors AFTER attempting to log them above
+            try
+            {
+                File.AppendAllText(diagLogPath,
+                    $"  EffectiveArgs for Contains check: ['{string.Join("','", effectiveArgs)}']\n" +
+                    $"  isLaunchedBySCM (!UserInteractive): {isLaunchedBySCM}\n" +
+                    $"  hasServiceArgument (--windows-service): {hasServiceArgument}\n" +
+                    $"  DETERMINED runAsService: {runAsService}\n---\n");
+            }
+            catch { /* ignore */ }
+
+            // Console.WriteLine diagnostics remain but might not be visible in service context
             Console.WriteLine($"[App.CreateHostBuilder] DIAGNOSTIC: effectiveArgs = '{commandLineForLog}'");
             Console.WriteLine($"[App.CreateHostBuilder] DIAGNOSTIC: Environment.UserInteractive = {Environment.UserInteractive}");
             Console.WriteLine($"[App.CreateHostBuilder] DIAGNOSTIC: isLaunchedBySCM (derived from !UserInteractive) = {isLaunchedBySCM}");
@@ -229,154 +201,129 @@ namespace Log2Postgres
                     options.ServiceName = "Log2Postgres";
                 });
 
-                // Minimal Programmatic Serilog for service mode WITH SELFLog for diagnostics
-                var selfLogFilePath = Path.Combine(contentRoot, "logs", "serilog_selflog.txt");
-                Serilog.Debugging.SelfLog.Enable(msg => File.AppendAllText(selfLogFilePath, msg + Environment.NewLine));
-                Console.WriteLine($"[App.CreateHostBuilder] DIAGNOSTIC: Serilog SelfLog enabled to: {selfLogFilePath}");
-
-                Log.Logger = new LoggerConfiguration()
-                    .MinimumLevel.Verbose()
-                    .WriteTo.File(Path.Combine(contentRoot, "logs", "service_debug_.txt"), // Different name to avoid confusion
-                                  rollingInterval: RollingInterval.Day,
-                                  shared: true,
-                                  flushToDiskInterval: TimeSpan.FromSeconds(1))
-                    .Enrich.FromLogContext()
-                    .CreateLogger();
-                
-                Console.WriteLine("[App.CreateHostBuilder] DIAGNOSTIC: Minimal programmatic Serilog re-configured for service mode.");
-                hostBuilder.UseSerilog(); // Use the programmatically configured logger
-
-                hostBuilder.ConfigureLogging(logging =>
+                hostBuilder.UseSerilog((hostingContext, services, loggerConfiguration) => 
                 {
-                    logging.AddEventLog();
+                    string logDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
+                    string logFilePath = Path.Combine(logDirectory, "service_log_.txt");
+
+                    try
+                    {
+                        Directory.CreateDirectory(logDirectory);
+                        File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
+                            $"[{DateTime.Now:o}] SERVICE_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {logFilePath}\n");
+                    }
+                    catch (Exception ex)
+                    {
+                        File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
+                            $"[{DateTime.Now:o}] SERVICE_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}\n");
+                    }
+
+                    loggerConfiguration
+                        .ReadFrom.Configuration(hostingContext.Configuration)
+                        .Enrich.FromLogContext()
+                        .WriteTo.File(logFilePath, 
+                            rollingInterval: Serilog.RollingInterval.Day, 
+                            retainedFileCountLimit: 7,
+                            outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {Message:lj}{NewLine}{Exception}");
                 });
             }
             else
             {
-                // UI Mode: Continue using Serilog from appsettings.json
-                hostBuilder.UseSerilog((hostingContext, loggerConfiguration) =>
+                hostBuilder.UseSerilog((hostingContext, services, loggerConfiguration) => 
                 {
+                    string logDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
+                    string uiLogFilePath = Path.Combine(logDirectory, "ui_log_.txt"); 
+
+                    try
+                    {
+                        Directory.CreateDirectory(logDirectory);
+                        File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
+                           $"[{DateTime.Now:o}] UI_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {uiLogFilePath}\n");
+                    }
+                    catch (Exception ex)
+                    {
+                        File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
+                           $"[{DateTime.Now:o}] UI_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}\n");
+                    }
+                    
                     loggerConfiguration
                         .ReadFrom.Configuration(hostingContext.Configuration)
-                        .Enrich.FromLogContext();
+                        .Enrich.FromLogContext()
+                        .WriteTo.File(uiLogFilePath, 
+                            rollingInterval: Serilog.RollingInterval.Day, 
+                            retainedFileCountLimit: 7,
+                            outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {Message:lj}{NewLine}{Exception}");
                 });
             }
 
             hostBuilder.ConfigureServices((hostContext, services) =>
             {
-                // Configure WindowsServiceSettings based on run mode
-                services.Configure<WindowsServiceSettings>(options => options.RunAsService = runAsService);
-                
-                // Register the password encryption service first
+                services.AddSingleton<IConfiguration>(hostContext.Configuration);
                 services.AddSingleton<PasswordEncryption>();
-                
-                // Get database settings from configuration
-                var dbSettings = hostContext.Configuration.GetSection("DatabaseSettings").Get<DatabaseSettings>();
-                
-                // Create the logger factory and get a logger for password encryption
-                var loggerFactory = LoggerFactory.Create(builder => 
-                { 
-                    builder.AddConfiguration(hostContext.Configuration.GetSection("Logging"))
-                           .AddConsole()
-                           .AddDebug(); 
+
+                services.Configure<WindowsServiceSettings>(options => 
+                {
+                    options.RunAsService = runAsService;
                 });
-                var encryptionLogger = loggerFactory.CreateLogger<PasswordEncryption>();
+
+                services.Configure<DatabaseSettings>(hostContext.Configuration.GetSection("DatabaseSettings"));
                 
-                // Create password encryption service and decrypt password if needed
-                var passwordEncryption = new PasswordEncryption(encryptionLogger);
+                services.AddSingleton<IPostConfigureOptions<DatabaseSettings>, DatabaseSettingsPostConfigureOptions>();
                 
-                // Process password only if dbSettings itself is not null
-                if (dbSettings != null) 
+                services.Configure<LogMonitorSettings>(hostContext.Configuration.GetSection("LogMonitorSettings"));
+
+                services.PostConfigure<LogMonitorSettings>(options =>
                 {
-                    // Decrypt the password if it's present and encrypted
-                    if (!string.IsNullOrEmpty(dbSettings.Password) && passwordEncryption.IsEncrypted(dbSettings.Password))
+                    bool wasBaseDirNull = false;
+                    if (options.BaseDirectory == null)
                     {
-                        dbSettings.Password = passwordEncryption.DecryptPassword(dbSettings.Password);
-                    }
-                }
-                // If dbSettings is null, its values won't be used in the configuration below.
-                
-                // Register the database settings with the decrypted password
-                services.Configure<DatabaseSettings>(options => 
-                {
-                    if (dbSettings != null)
-                    {
-                        // Apply configured values if dbSettings was successfully loaded
-                        options.Host = dbSettings.Host;
-                        options.Port = dbSettings.Port;
-                        options.Username = dbSettings.Username;
-                        options.Password = dbSettings.Password; // This is now the (potentially) decrypted password
-                        options.Database = dbSettings.Database;
-                        options.Schema = dbSettings.Schema;
-                        options.Table = dbSettings.Table;
-                        options.ConnectionTimeout = dbSettings.ConnectionTimeout;
-                    }
-                    else
-                    {
-                        // If dbSettings is null (e.g., section missing in appsettings.json),
-                        // explicitly set defaults for options. The DatabaseSettings class itself
-                        // has defaults, but being explicit here ensures clarity.
-                        options.Host = "localhost"; 
-                        options.Port = "5432";      
-                        options.Username = string.Empty;
-                        options.Password = string.Empty;
-                        options.Database = "postgres"; 
-                        options.Schema = "public";   
-                        options.Table = "orf_logs"; 
-                        options.ConnectionTimeout = 30; 
-                    }
-                });
-                
-                // Get log monitor settings from configuration
-                var logMonitorSettings = hostContext.Configuration.GetSection("LogMonitorSettings").Get<LogMonitorSettings>();
-                
-                // Register configuration sections for log monitor settings with default values if needed
-                services.Configure<LogMonitorSettings>(options =>
-                {
-                    if (logMonitorSettings != null)
-                    {
-                        options.BaseDirectory = logMonitorSettings.BaseDirectory ?? string.Empty; 
-                        options.LogFilePattern = logMonitorSettings.LogFilePattern ?? "orfee-{Date:yyyy-MM-dd}.log";
-                        options.PollingIntervalSeconds = logMonitorSettings.PollingIntervalSeconds > 0 ? logMonitorSettings.PollingIntervalSeconds : 5;
-                    }
-                    else
-                    {
-                        // If logMonitorSettings is null, use default values
                         options.BaseDirectory = string.Empty;
-                        options.LogFilePattern = "orfee-{Date:yyyy-MM-dd}.log";
-                        options.PollingIntervalSeconds = 5;
+                        wasBaseDirNull = true;
                     }
+
+                    bool wasPatternNull = false;
+                    if (string.IsNullOrEmpty(options.LogFilePattern))
+                    {
+                        options.LogFilePattern = "orfee-{Date:yyyy-MM-dd}.log";
+                        wasPatternNull = true;
+                    }
+                    bool pollingIntervalAdjusted = false;
+                    if (options.PollingIntervalSeconds <= 0) {
+                        options.PollingIntervalSeconds = 5;
+                        pollingIntervalAdjusted = true;
+                    }
+
+                    Console.WriteLine($"[App.PostConfigure<LogMonitorSettings>] DIAGNOSTIC: Options.BaseDirectory = '{options.BaseDirectory}' (was null: {wasBaseDirNull})");
+                    Console.WriteLine($"[App.PostConfigure<LogMonitorSettings>] DIAGNOSTIC: Options.LogFilePattern = '{options.LogFilePattern}' (was null/empty: {wasPatternNull})");
+                    Console.WriteLine($"[App.PostConfigure<LogMonitorSettings>] DIAGNOSTIC: Options.PollingIntervalSeconds = '{options.PollingIntervalSeconds}' (adjusted: {pollingIntervalAdjusted})");
                 });
                 
-                // Register core processing services as singletons
                 services.AddSingleton<OrfLogParser>();
+                services.AddSingleton<PostgresService>(sp => 
+                {
+                    var logger = sp.GetRequiredService<ILogger<PostgresService>>();
+                    var dbSettings = sp.GetRequiredService<IOptionsMonitor<DatabaseSettings>>();
+                    return new PostgresService(logger, dbSettings);
+                });
+                services.AddSingleton<IPasswordEncryption, PasswordEncryption>();
                 services.AddSingleton<PositionManager>();
-                services.AddSingleton<PostgresService>(); // Ensure PostgresService and its dependencies (like IOptions<DatabaseSettings>) are correctly set up
 
-                // Conditionally register LogFileWatcher
-                if (runAsService)
-                {
-                    // When running as a Windows service, LogFileWatcher is the main worker.
-                    // It will auto-start its processing loop via its ExecuteAsync.
-                    services.AddHostedService<LogFileWatcher>();
-                    
-                    // Log that we are in service registration mode
-                    var logger = services.BuildServiceProvider().GetRequiredService<ILogger<App>>();
-                    logger.LogInformation("Application configured to run as a Windows Service. LogFileWatcher registered as HostedService.");
-                }
-                else
-                {
-                    // When running in UI mode, LogFileWatcher is available as a singleton.
-                    // The UI will call UIManagedStartProcessingAsync / UIManagedStopProcessing on it.
-                    services.AddSingleton<LogFileWatcher>();
-                    
-                    // Log that we are in UI/desktop registration mode
-                    var logger = services.BuildServiceProvider().GetRequiredService<ILogger<App>>();
-                    logger.LogInformation("Application configured to run in UI/Desktop mode. LogFileWatcher registered as Singleton.");
-                }
+                services.AddHostedService<LogFileWatcher>();
 
-                // Register MainWindow for WPF
-                services.AddSingleton<MainWindow>();
+                services.AddSingleton<LogFileWatcher>(sp => 
+                {
+                    var hostedServices = sp.GetServices<IHostedService>();
+                    var serviceInstance = hostedServices.OfType<LogFileWatcher>().FirstOrDefault();
+                    
+                    if (serviceInstance == null)
+                    {
+                        Console.Error.WriteLine("CRITICAL_DI_ERROR: LogFileWatcher instance not found among IHostedService registrations. MainWindow/IPC will likely fail to get the correct instance.");
+                        throw new InvalidOperationException("LogFileWatcher instance, registered via AddHostedService, could not be resolved for singleton access. This indicates a DI configuration or resolution order problem.");
+                    }
+                    return serviceInstance;
+                });
+
+                services.AddTransient<MainWindow>();
             });
 
             return hostBuilder;
@@ -384,90 +331,63 @@ namespace Log2Postgres
 
         protected override async void OnStartup(StartupEventArgs e)
         {
-            if (_host == null) 
-            {
-                 // Host creation failed, App constructor showed an error window, or shut down.
-                 // Ensure we don't proceed with host-dependent logic.
-                 base.OnStartup(e);
-                 if (Current == null || Current.MainWindow == null) 
-                 {
-                    // If even the error window couldn't show, or we are shutting down.
-                    Shutdown();
-                 }
-                 return;
-            }
+            base.OnStartup(e);
+            var logger = _host.Services.GetRequiredService<ILogger<App>>();
+            logger.LogInformation("App.OnStartup entered. Host is {Status}.", _host != null ? "INITIALIZED" : "NULL");
 
-            try
-            {
-                await _host.StartAsync();
+            var serviceSettings = _host.Services.GetService<IOptions<WindowsServiceSettings>>()?.Value;
+            bool runAsService = serviceSettings?.RunAsService ?? false; 
+            logger.LogInformation("App.OnStartup: Determined runAsService = {RunAsService}", runAsService);
 
-                var mainWindow = GetService<MainWindow>();
-                Current.MainWindow = mainWindow;
-                mainWindow.Show();
-                
-                 // Log application startup mode
-                var logger = GetService<ILogger<App>>();
-                var serviceSettings = GetService<IOptions<WindowsServiceSettings>>();
-                if (serviceSettings.Value.RunAsService)
-                {
-                    logger.LogInformation("Log2Postgres application starting in Service Mode.");
-                }
-                else
-                {
-                    logger.LogInformation("Log2Postgres application starting in UI/Desktop Mode.");
-                }
-            }
-            catch (Exception ex)
+            if (runAsService)
             {
-                 // Log the error to a file if possible, as logging service might not be up
+                logger.LogInformation("App.OnStartup: Running as a service, UI (MainWindow) will not be shown by App.OnStartup.");
+            }
+            else
+            {
+                logger.LogInformation("App.OnStartup: Running in UI/Desktop mode. Showing MainWindow.");
+
                 try
                 {
-                    string errorFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "startup_error.txt");
-                    File.WriteAllText(errorFilePath, $"Error during OnStartup: {ex.ToString()}");
-
-                    System.Windows.MessageBox.Show(
-                        $"Critical error during application startup: {ex.Message}\n\nDetails have been logged to startup_error.txt", 
-                        "Startup Error", 
-                        MessageBoxButton.OK, 
-                        MessageBoxImage.Error);
+                    var mainWindow = _host.Services.GetRequiredService<MainWindow>();
+                    mainWindow.Show();
+                    logger.LogInformation("App.OnStartup: MainWindow shown.");
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Fallback if we can't even write the error file
-                    System.Windows.MessageBox.Show(
-                        $"Catastrophic error during application startup: {ex.Message}", 
-                        "Fatal Startup Error", 
-                        MessageBoxButton.OK, 
-                        MessageBoxImage.Error);
+                    logger.LogCritical(ex, "App.OnStartup: Failed to create or show MainWindow.");
+                    System.Windows.MessageBox.Show($"Failed to start the main application window: {ex.Message}", "Fatal UI Error", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error);
+                    Shutdown(-1);
                 }
-                
-                // Ensure the application shuts down if startup fails critically
-                if (Current != null)
-                {
-                    Current.Shutdown(-1); // Exit with an error code
-                }
-                else
-                {
-                    Environment.Exit(-1); // Force exit if Current is null
-                }
-                return; // Stop further execution in this method
             }
-
-            base.OnStartup(e);
         }
 
         protected override async void OnExit(ExitEventArgs e)
         {
-            // Release the mutex
-            if (_singleInstanceMutex != null && _host != null)
+            var logger = _host?.Services.GetService<ILogger<App>>();
+            logger?.LogInformation("App.OnExit: Application exiting. Attempting to stop and dispose host.");
+            if (_host != null)
             {
-                // Only clean up if we successfully acquired the mutex and created the host
-                await _host.StopAsync();
-                _host.Dispose();
-                
-                _singleInstanceMutex.ReleaseMutex();
-                _singleInstanceMutex.Dispose();
+                try
+                {
+                    await _host.StopAsync(TimeSpan.FromSeconds(5));
+                }
+                catch (Exception ex)
+                {
+                    logger?.LogError(ex, "App.OnExit: Exception during host.StopAsync().");
+                }
+                finally
+                {
+                    _host.Dispose();
+                    logger?.LogInformation("App.OnExit: Host disposed.");
+                }
             }
+            _singleInstanceMutex?.ReleaseMutex();
+            _singleInstanceMutex?.Dispose();
+            
+            // Ensure Serilog is flushed and closed properly
+            logger?.LogInformation("App.OnExit: Closing and flushing Serilog.");
+            Serilog.Log.CloseAndFlush();
             
             base.OnExit(e);
         }
@@ -485,30 +405,18 @@ namespace Log2Postgres
         {
             string serviceName = "Log2Postgres";
             string displayName = "Log2Postgres ORF Log Watcher";
-            // Get the path to the current executable
             string? exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
             if (string.IsNullOrEmpty(exePath) || !exePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
             {
-                // This case might happen if it's a .dll being run via dotnet.exe.
-                // For a published .exe, exePath should be correct.
-                // If it's a framework-dependent deployment run via `dotnet YourApp.dll`,
-                // the path needs to be `dotnet "path\to\YourApp.dll" --windows-service`
-                // For self-contained, exePath is fine.
-                // Assuming self-contained .exe for now.
-                // A more robust solution handles both by checking Process.MainModule.FileName or Assembly.EntryPoint
                 var mainModule = Process.GetCurrentProcess().MainModule;
                 if (mainModule != null)
                 {
                     exePath = mainModule.FileName;
-                    // If running via `dotnet.exe`, mainModule.FileName is dotnet.exe.
-                    // We need the path to our DLL in that case.
                     if (exePath.EndsWith("dotnet.exe", StringComparison.OrdinalIgnoreCase))
                     {
-                        // This is a framework-dependent deployment. We need to find the DLL path.
-                        // Assembly.GetEntryAssembly().Location should give the DLL.
                         string? entryAssemblyLocation = System.Reflection.Assembly.GetEntryAssembly()?.Location;
                         if (!string.IsNullOrEmpty(entryAssemblyLocation) && entryAssemblyLocation.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)){
-                             exePath = $"\"{Environment.ProcessPath}\" \"{entryAssemblyLocation}\""; // Path to dotnet.exe and path to DLL
+                             exePath = $"\"{Environment.ProcessPath}\" \"{entryAssemblyLocation}\"";
                         }
                         else {
                             Console.WriteLine("Error: Could not determine application DLL path for service installation.");
@@ -525,10 +433,7 @@ namespace Log2Postgres
                 }
             }
 
-            string binPath = $"\"{exePath}\" --windows-service"; // Crucial: --windows-service arg for SCM
-            // For LocalSystem: obj= LocalSystem
-            // For NetworkService: obj= "NT AUTHORITY\NetworkService"
-            // For LocalService: obj= "NT AUTHORITY\LocalService"
+            string binPath = $"\"{exePath}\" --windows-service";
             string command = $"create {serviceName} binPath= \"{binPath}\" DisplayName= \"{displayName}\" start= auto obj= \"NT AUTHORITY\\NetworkService\"";
 
             Console.WriteLine($"Attempting to install service with command: sc.exe {command}");
@@ -572,7 +477,6 @@ namespace Log2Postgres
         {
             string serviceName = "Log2Postgres";
 
-            // Attempt to stop the service first
             string stopCommand = $"stop {serviceName}";
             Console.WriteLine($"Attempting to stop service with command: sc.exe {stopCommand}");
             try
@@ -589,7 +493,6 @@ namespace Log2Postgres
                     string stopOutput = process.StandardOutput.ReadToEnd();
                     string stopError = process.StandardError.ReadToEnd();
                     process.WaitForExit();
-                    // Exit code 1062 means service not started, 1060 means service does not exist - both are fine for uninstall.
                     if (process.ExitCode == 0 || process.ExitCode == 1062 || process.ExitCode == 1060)
                     {
                         Console.WriteLine("Service stop command executed (or service was not running/not found).");
@@ -599,14 +502,12 @@ namespace Log2Postgres
                         Console.WriteLine($"Service stop command failed. Exit code: {process.ExitCode}");
                         Console.WriteLine("Output: " + stopOutput);
                         Console.WriteLine("Error: " + stopError);
-                        // Don't necessarily block uninstallation if stop fails, but log it.
                     }
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Exception during service stop attempt: {ex.Message}");
-                // Continue with uninstallation
             }
 
             string deleteCommand = $"delete {serviceName}";
@@ -646,6 +547,25 @@ namespace Log2Postgres
                 System.Windows.MessageBox.Show($"Exception during service uninstallation: {ex.Message}", "Uninstallation Exception", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
+    }
+
+    internal class ApplicationLifetime : IHostApplicationLifetime
+    {
+        private readonly CancellationTokenSource _startedSource = new CancellationTokenSource();
+        private readonly CancellationTokenSource _stoppingSource = new CancellationTokenSource();
+        private readonly CancellationTokenSource _stoppedSource = new CancellationTokenSource();
+
+        public CancellationToken ApplicationStarted => _startedSource.Token;
+        public CancellationToken ApplicationStopping => _stoppingSource.Token;
+        public CancellationToken ApplicationStopped => _stoppedSource.Token;
+
+        public void StopApplication()
+        {
+            _stoppingSource.Cancel();
+        }
+
+        public void NotifyStarted() => _startedSource.Cancel(); 
+        public void NotifyStopped() => _stoppedSource.Cancel();
     }
 }
 

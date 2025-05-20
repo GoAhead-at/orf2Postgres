@@ -8,7 +8,7 @@ namespace Log2Postgres.Core.Services
     /// <summary>
     /// Handles secure password encryption and decryption using Windows DPAPI
     /// </summary>
-    public class PasswordEncryption
+    public class PasswordEncryption : IPasswordEncryption
     {
         private readonly ILogger<PasswordEncryption> _logger;
         private readonly string _entropy;
@@ -17,14 +17,11 @@ namespace Log2Postgres.Core.Services
         {
             _logger = logger;
             
-            // Generate a unique entropy value based on machine information
-            // This helps prevent decryption on different machines
-            string machineName = Environment.MachineName;
-            string osVersion = Environment.OSVersion.ToString();
-            _entropy = $"Log2Postgres_{machineName}_{osVersion}";
-            
-            _logger.LogDebug("Password encryption initialized");
-            _logger.LogWarning("DEBUG PURPOSE ONLY - Entropy value: '{Entropy}' [SECURITY RISK - REMOVE THIS LOG]", _entropy);
+            // Use a unique but stable entropy for the current user and machine scope
+            // Workstation ID is typically Environment.MachineName
+            // OS Version provides further stability against changes in .NET runtime versions influencing GetHashCode()
+            _entropy = $"Log2Postgres_{Environment.MachineName}_{Environment.OSVersion.VersionString}";
+            _logger.LogDebug("Password encryption initialized with entropy based on MachineName and OSVersion.");
         }
         
         /// <summary>
@@ -39,28 +36,22 @@ namespace Log2Postgres.Core.Services
                 
             try
             {
-                // DEBUG ONLY - Log the plaintext password - REMOVE IN PRODUCTION
-                _logger.LogWarning("DEBUG PURPOSE ONLY - Encrypting plaintext password: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", plainText);
-                
                 // Convert the password and entropy to byte arrays
-                byte[] passwordBytes = Encoding.UTF8.GetBytes(plainText);
-                byte[] entropyBytes = Encoding.UTF8.GetBytes(_entropy);
+                byte[] passwordBytes = Encoding.Unicode.GetBytes(plainText);
+                byte[] entropyBytes = Encoding.Unicode.GetBytes(_entropy);
                 
                 // Encrypt the password
                 byte[] encryptedBytes = ProtectedData.Protect(
                     passwordBytes, 
                     entropyBytes, 
-                    DataProtectionScope.LocalMachine);
+                    DataProtectionScope.CurrentUser);
                 
                 // Convert to Base64 for storage
                 string encryptedPassword = Convert.ToBase64String(encryptedBytes);
                 
-                _logger.LogDebug("Password encrypted successfully");
-                _logger.LogWarning("DEBUG PURPOSE ONLY - Encrypted result: '{Result}' [SECURITY RISK - REMOVE THIS LOG]", encryptedPassword);
-                
                 return encryptedPassword;
             }
-            catch (Exception ex)
+            catch (CryptographicException ex)
             {
                 _logger.LogError(ex, "Error encrypting password: {Message}", ex.Message);
                 return string.Empty;
@@ -79,28 +70,22 @@ namespace Log2Postgres.Core.Services
                 
             try
             {
-                // DEBUG ONLY - Log the encrypted text - REMOVE IN PRODUCTION
-                _logger.LogWarning("DEBUG PURPOSE ONLY - Decrypting text: '{Text}' [SECURITY RISK - REMOVE THIS LOG]", encryptedText);
-                
                 // Convert the encrypted password from Base64
                 byte[] encryptedBytes = Convert.FromBase64String(encryptedText);
-                byte[] entropyBytes = Encoding.UTF8.GetBytes(_entropy);
+                byte[] entropyBytes = Encoding.Unicode.GetBytes(_entropy);
                 
                 // Decrypt the password
                 byte[] decryptedBytes = ProtectedData.Unprotect(
                     encryptedBytes, 
                     entropyBytes, 
-                    DataProtectionScope.LocalMachine);
+                    DataProtectionScope.CurrentUser);
                 
                 // Convert back to a string
-                string decryptedPassword = Encoding.UTF8.GetString(decryptedBytes);
-                
-                _logger.LogDebug("Password decrypted successfully");
-                _logger.LogWarning("DEBUG PURPOSE ONLY - Decryption result: '{Result}' [SECURITY RISK - REMOVE THIS LOG]", decryptedPassword);
+                string decryptedPassword = Encoding.Unicode.GetString(decryptedBytes);
                 
                 return decryptedPassword;
             }
-            catch (Exception ex)
+            catch (FormatException ex) // Handles invalid Base64 string
             {
                 _logger.LogError(ex, "Error decrypting password: {Message}", ex.Message);
                 return string.Empty;
