@@ -319,7 +319,7 @@ The WPF User Interface provides:
 
 - **Encryption & Access Rights:**
   - Elevation (UAC) used when saving service-mode configurations
-  - Windows DPAPI with LocalMachine scope for service-compatible encryption
+  - Windows DPAPI uses `DataProtectionScope.LocalMachine` (instead of `CurrentUser`) to ensure passwords encrypted by the UI (running as a user) can be decrypted by the service (potentially running as a different, e.g., system, account), ensuring service-compatible encryption.
   - Configuration marked as "service-ready" when prepared with system-level encryption
   - Graceful fallback for access rights differences between user and system contexts
 
