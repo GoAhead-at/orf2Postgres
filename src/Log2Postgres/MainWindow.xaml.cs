@@ -1051,8 +1051,28 @@ public partial class MainWindow : Window, IAsyncDisposable
                                  $"Errors: {(ErrorFilterToggle.IsChecked == true ? "ON" : "OFF")}";
             _logger.LogDebug(filterState);
             
+            // Ensure essential UI components are available before proceeding.
+            if (LogTextBox == null || InfoFilterToggle == null || WarningFilterToggle == null || ErrorFilterToggle == null)
+            {
+                _logger.LogWarning("ApplyLogFilter: Essential UI components are null. Aborting to prevent NullReferenceException.");
+                return;
+            }
+
+            // Always clear the LogTextBox first.
+            // If originalText (from Tag) is empty or all filters are off leading to no lines being added, 
+            // the LogTextBox will remain empty.
+            LogTextBox.Clear();
+
             string? originalText = LogTextBox.Tag as string;
-            if (string.IsNullOrEmpty(originalText) || LogTextBox == null || InfoFilterToggle == null || WarningFilterToggle == null || ErrorFilterToggle == null) return;
+
+            if (string.IsNullOrEmpty(originalText))
+            {
+                // If there's no backing log data (Tag is empty), there's nothing further to filter or display.
+                // LogTextBox is already cleared. ScrollToEnd can be called for consistency, though it might have no visible effect.
+                LogTextBox.ScrollToEnd();
+                _logger.LogDebug("ApplyLogFilter: LogTextBox.Tag is empty or null. Log display has been cleared.");
+                return;
+            }
 
             bool showInfo = InfoFilterToggle.IsChecked == true;
             bool showWarn = WarningFilterToggle.IsChecked == true;
@@ -1060,12 +1080,14 @@ public partial class MainWindow : Window, IAsyncDisposable
 
             if (showInfo && showWarn && showError)
             {
+                // If all filters are effectively "show all", set text directly from original (Tag)
                 if(LogTextBox.Text != originalText) LogTextBox.Text = originalText;
                 LogTextBox.ScrollToEnd();
                 return;
             }
             
-            LogTextBox.Clear();
+            // No early return for IsNullOrEmpty, and LogTextBox.Clear() has been moved to the top.
+            // The existing LogTextBox.Clear() that was here previously is now removed.
             string[] lines = originalText.Split(new[] { Environment.NewLine }, StringSplitOptions.RemoveEmptyEntries);
             foreach (string line in lines)
             {
