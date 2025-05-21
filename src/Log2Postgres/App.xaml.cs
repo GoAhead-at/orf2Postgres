@@ -25,6 +25,7 @@ namespace Log2Postgres
     /// </summary>
     public partial class App : System.Windows.Application
     {
+        public const string WindowsServiceName = "Log2Postgres";
         private IHost _host;
         private static Mutex _singleInstanceMutex = null!;
         private const string MutexName = "Log2PostgresAppSingleInstance";
@@ -198,7 +199,7 @@ namespace Log2Postgres
             {
                 hostBuilder.UseWindowsService(options =>
                 {
-                    options.ServiceName = "Log2Postgres";
+                    options.ServiceName = WindowsServiceName;
                 });
 
                 hostBuilder.UseSerilog((hostingContext, services, loggerConfiguration) => 
@@ -307,6 +308,7 @@ namespace Log2Postgres
                 });
                 services.AddSingleton<IPasswordEncryption, PasswordEncryption>();
                 services.AddSingleton<PositionManager>();
+                services.AddSingleton<IIpcService, IpcService>();
 
                 services.AddHostedService<LogFileWatcher>();
 
@@ -332,63 +334,102 @@ namespace Log2Postgres
         protected override async void OnStartup(StartupEventArgs e)
         {
             base.OnStartup(e);
-            var logger = _host.Services.GetRequiredService<ILogger<App>>();
-            logger.LogInformation("App.OnStartup entered. Host is {Status}.", _host != null ? "INITIALIZED" : "NULL");
+            Console.WriteLine("[App.OnStartup] Application starting.");
+            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup ENTERED.\n");
 
-            var serviceSettings = _host.Services.GetService<IOptions<WindowsServiceSettings>>()?.Value;
-            bool runAsService = serviceSettings?.RunAsService ?? false; 
-            logger.LogInformation("App.OnStartup: Determined runAsService = {RunAsService}", runAsService);
+            bool createdNew;
+            _singleInstanceMutex = new Mutex(true, MutexName, out createdNew);
 
-            if (runAsService)
+            if (!createdNew)
             {
-                logger.LogInformation("App.OnStartup: Running as a service, UI (MainWindow) will not be shown by App.OnStartup.");
+                // Another instance is already running.
+                Console.WriteLine("[App.OnStartup] Another instance detected. Activating it and shutting down current instance.");
+                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: Another instance detected. Activating and exiting.\n");
+                ActivateExistingInstance();
+                Shutdown();
+                return;
+            }
+
+            // Proceed with starting the host and showing the main window for the new instance.
+            if (_host == null)
+            {
+                Console.WriteLine("[App.OnStartup] _host is null, attempting to build it.");
+                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: _host is null, building.\n");
+                _host = CreateHostBuilder(Environment.GetCommandLineArgs()).Build(); 
+            }
+            
+            Console.WriteLine("[App.OnStartup] Calling _host.StartAsync().");
+            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: Calling _host.StartAsync().\n");
+            await _host.StartAsync(); // Await the host start
+            Console.WriteLine("[App.OnStartup] _host.StartAsync() completed.");
+            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: _host.StartAsync() completed.\n");
+
+            if (!IsRunningAsService()) // Only show UI if not running as a service
+            {
+                var mainWindow = _host.Services.GetService<MainWindow>();
+                if (mainWindow != null) 
+                {
+                    this.MainWindow = mainWindow; // Assign to App.MainWindow
+                    mainWindow.Show();
+                    Console.WriteLine("[App.OnStartup] MainWindow shown.");
+                    File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: MainWindow shown.\n");
+                }
+                else
+                {
+                    Console.Error.WriteLine("[App.OnStartup] CRITICAL: MainWindow could not be resolved from services. UI will not show.");
+                    File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: CRITICAL - MainWindow is null.\n");
+                    // Optionally, shutdown or show a message box
+                    System.Windows.MessageBox.Show("Critical error: Main window could not be created. Application will exit.", "Startup Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    Shutdown(1);
+                }
             }
             else
             {
-                logger.LogInformation("App.OnStartup: Running in UI/Desktop mode. Showing MainWindow.");
-
-                try
-                {
-                    var mainWindow = _host.Services.GetRequiredService<MainWindow>();
-                    mainWindow.Show();
-                    logger.LogInformation("App.OnStartup: MainWindow shown.");
-                }
-                catch (Exception ex)
-                {
-                    logger.LogCritical(ex, "App.OnStartup: Failed to create or show MainWindow.");
-                    System.Windows.MessageBox.Show($"Failed to start the main application window: {ex.Message}", "Fatal UI Error", System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error);
-                    Shutdown(-1);
-                }
+                Console.WriteLine("[App.OnStartup] Running as a service. UI (MainWindow) will not be shown.");
+                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: Running as service, UI not shown.\n");
             }
+            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup EXITED NORMALLY.\n");
+        }
+
+        private static bool IsRunningAsService()
+        {
+            // This logic should be consistent with CreateHostBuilder
+            // Consider if effectiveArgs needs to be passed or re-evaluated if this is called before CreateHostBuilder sets them up.
+            // For OnStartup, CreateHostBuilder has likely run.
+            string[] effectiveArgs = Environment.GetCommandLineArgs(); // Or retrieve from a shared place if set by CreateHostBuilder
+            bool isLaunchedBySCM = !Environment.UserInteractive;
+            bool hasServiceArgument = effectiveArgs.Contains("--windows-service", StringComparer.OrdinalIgnoreCase);
+            return isLaunchedBySCM || hasServiceArgument;
         }
 
         protected override async void OnExit(ExitEventArgs e)
         {
-            var logger = _host?.Services.GetService<ILogger<App>>();
-            logger?.LogInformation("App.OnExit: Application exiting. Attempting to stop and dispose host.");
+            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit ENTERED. ExitCode: {e.ApplicationExitCode}\n");
+            Console.WriteLine($"[App.OnExit] Application exiting with code: {e.ApplicationExitCode}");
+            
             if (_host != null)
             {
-                try
-                {
-                    await _host.StopAsync(TimeSpan.FromSeconds(5));
-                }
-                catch (Exception ex)
-                {
-                    logger?.LogError(ex, "App.OnExit: Exception during host.StopAsync().");
-                }
-                finally
-                {
-                    _host.Dispose();
-                    logger?.LogInformation("App.OnExit: Host disposed.");
-                }
+                Console.WriteLine("[App.OnExit] Calling _host.StopAsync().");
+                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit: Calling _host.StopAsync().\n");
+                await _host.StopAsync(); // Await the host stop
+                _host.Dispose();
+                Console.WriteLine("[App.OnExit] _host stopped and disposed.");
+                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit: _host stopped and disposed.\n");
             }
+            else
+            {
+                Console.WriteLine("[App.OnExit] _host was null. No host stop/dispose action taken.");
+                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit: _host was null.\n");
+            }
+
             _singleInstanceMutex?.ReleaseMutex();
             _singleInstanceMutex?.Dispose();
-            
-            // Ensure Serilog is flushed and closed properly
-            logger?.LogInformation("App.OnExit: Closing and flushing Serilog.");
+            Console.WriteLine("[App.OnExit] Single instance mutex released and disposed.");
+            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit: Mutex released/disposed.\n");
+
             Serilog.Log.CloseAndFlush();
-            
+            Console.WriteLine("[App.OnExit] Serilog closed and flushed.");
+            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit: Serilog flushed. EXITED NORMALLY.\n");
             base.OnExit(e);
         }
 
@@ -403,7 +444,7 @@ namespace Log2Postgres
 
         public static void InstallService()
         {
-            string serviceName = "Log2Postgres";
+            string serviceName = WindowsServiceName;
             string displayName = "Log2Postgres ORF Log Watcher";
             string? exePath = System.Reflection.Assembly.GetExecutingAssembly().Location;
             if (string.IsNullOrEmpty(exePath) || !exePath.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
@@ -443,13 +484,10 @@ namespace Log2Postgres
                 {
                     process.StartInfo.FileName = "sc.exe";
                     process.StartInfo.Arguments = command;
-                    process.StartInfo.UseShellExecute = false;
-                    process.StartInfo.RedirectStandardOutput = true;
-                    process.StartInfo.RedirectStandardError = true;
+                    process.StartInfo.UseShellExecute = true;
+                    process.StartInfo.Verb = "runas";
                     process.StartInfo.CreateNoWindow = true;
                     process.Start();
-                    string output = process.StandardOutput.ReadToEnd();
-                    string error = process.StandardError.ReadToEnd();
                     process.WaitForExit();
 
                     if (process.ExitCode == 0)
@@ -460,9 +498,7 @@ namespace Log2Postgres
                     else
                     {
                         Console.WriteLine($"Service installation failed. Exit code: {process.ExitCode}");
-                        Console.WriteLine("Output: " + output);
-                        Console.WriteLine("Error: " + error);
-                        System.Windows.MessageBox.Show($"Service installation failed. Exit code: {process.ExitCode}\nOutput: {output}\nError: {error}", "Installation Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                        System.Windows.MessageBox.Show($"Service installation failed. Exit code: {process.ExitCode}", "Installation Error", MessageBoxButton.OK, MessageBoxImage.Error);
                     }
                 }
             }
@@ -475,7 +511,7 @@ namespace Log2Postgres
 
         public static void UninstallService()
         {
-            string serviceName = "Log2Postgres";
+            string serviceName = WindowsServiceName;
 
             string stopCommand = $"stop {serviceName}";
             Console.WriteLine($"Attempting to stop service with command: sc.exe {stopCommand}");
@@ -485,14 +521,12 @@ namespace Log2Postgres
                 {
                     process.StartInfo.FileName = "sc.exe";
                     process.StartInfo.Arguments = stopCommand;
-                    process.StartInfo.UseShellExecute = false;
-                    process.StartInfo.RedirectStandardOutput = true;
-                    process.StartInfo.RedirectStandardError = true;
+                    process.StartInfo.UseShellExecute = true;
+                    process.StartInfo.Verb = "runas";
                     process.StartInfo.CreateNoWindow = true;
                     process.Start();
-                    string stopOutput = process.StandardOutput.ReadToEnd();
-                    string stopError = process.StandardError.ReadToEnd();
                     process.WaitForExit();
+
                     if (process.ExitCode == 0 || process.ExitCode == 1062 || process.ExitCode == 1060)
                     {
                         Console.WriteLine("Service stop command executed (or service was not running/not found).");
@@ -500,8 +534,6 @@ namespace Log2Postgres
                     else
                     {
                         Console.WriteLine($"Service stop command failed. Exit code: {process.ExitCode}");
-                        Console.WriteLine("Output: " + stopOutput);
-                        Console.WriteLine("Error: " + stopError);
                     }
                 }
             }
@@ -518,13 +550,10 @@ namespace Log2Postgres
                 {
                     process.StartInfo.FileName = "sc.exe";
                     process.StartInfo.Arguments = deleteCommand;
-                    process.StartInfo.UseShellExecute = false;
-                    process.StartInfo.RedirectStandardOutput = true;
-                    process.StartInfo.RedirectStandardError = true;
+                    process.StartInfo.UseShellExecute = true;
+                    process.StartInfo.Verb = "runas";
                     process.StartInfo.CreateNoWindow = true;
                     process.Start();
-                    string output = process.StandardOutput.ReadToEnd();
-                    string error = process.StandardError.ReadToEnd();
                     process.WaitForExit();
 
                     if (process.ExitCode == 0)
@@ -535,9 +564,7 @@ namespace Log2Postgres
                     else
                     {
                         Console.WriteLine($"Service uninstallation failed. Exit code: {process.ExitCode}");
-                        Console.WriteLine("Output: " + output);
-                        Console.WriteLine("Error: " + error);
-                        System.Windows.MessageBox.Show($"Service uninstallation failed. Exit code: {process.ExitCode}\nOutput: {output}\nError: {error}", "Uninstallation Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                        System.Windows.MessageBox.Show($"Service uninstallation failed. Exit code: {process.ExitCode}", "Uninstallation Error", MessageBoxButton.OK, MessageBoxImage.Error);
                     }
                 }
             }
@@ -545,6 +572,75 @@ namespace Log2Postgres
             {
                 Console.WriteLine($"Exception during service uninstallation: {ex.Message}");
                 System.Windows.MessageBox.Show($"Exception during service uninstallation: {ex.Message}", "Uninstallation Exception", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        public static void StartWindowsService(string serviceName)
+        {
+            string command = $"start {serviceName}";
+            Console.WriteLine($"Attempting to start service '{serviceName}' with command: sc.exe {command}");
+            try
+            {
+                using (Process process = new Process())
+                {
+                    process.StartInfo.FileName = "sc.exe";
+                    process.StartInfo.Arguments = command;
+                    process.StartInfo.UseShellExecute = true;
+                    process.StartInfo.Verb = "runas";        
+                    process.StartInfo.CreateNoWindow = true;
+                    process.Start();
+                    process.WaitForExit(); // Wait for the UAC prompt and sc.exe to complete
+
+                    if (process.ExitCode == 0)
+                    {
+                        Console.WriteLine($"Service '{serviceName}' start command issued successfully.");
+                        // Consider a small delay or a loop to check service status if immediate feedback is needed beyond UAC.
+                        // For now, UAC prompt success/cancel is the main feedback.
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Service '{serviceName}' start command failed. Exit code: {process.ExitCode}. This might be normal if UAC was cancelled.");
+                        // No MessageBox here as UAC itself provides feedback or cancellation indication.
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Exception during service start: {ex.Message}");
+                System.Windows.MessageBox.Show($"Exception during service start: {ex.Message}", "Service Start Exception", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        public static void StopWindowsService(string serviceName)
+        {
+            string command = $"stop {serviceName}";
+            Console.WriteLine($"Attempting to stop service '{serviceName}' with command: sc.exe {command}");
+            try
+            {
+                using (Process process = new Process())
+                {
+                    process.StartInfo.FileName = "sc.exe";
+                    process.StartInfo.Arguments = command;
+                    process.StartInfo.UseShellExecute = true;
+                    process.StartInfo.Verb = "runas";
+                    process.StartInfo.CreateNoWindow = true;
+                    process.Start();
+                    process.WaitForExit();
+
+                    if (process.ExitCode == 0)
+                    {
+                        Console.WriteLine($"Service '{serviceName}' stop command issued successfully.");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Service '{serviceName}' stop command failed. Exit code: {process.ExitCode}. This might be normal if UAC was cancelled or service was already stopped.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Exception during service stop: {ex.Message}");
+                System.Windows.MessageBox.Show($"Exception during service stop: {ex.Message}", "Service Stop Exception", MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
     }
@@ -568,4 +664,5 @@ namespace Log2Postgres
         public void NotifyStopped() => _stoppedSource.Cancel();
     }
 }
+
 

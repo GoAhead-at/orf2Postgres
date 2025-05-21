@@ -25,6 +25,9 @@ namespace Log2Postgres.Core.Services
         // Event to notify when positions are loaded or reset
         public event Action<bool>? PositionsLoaded;
         
+        // Diagnostic property to expose the path
+        public string PositionsFilePathForDiagnostics => _positionsFilePath;
+        
         public PositionManager(ILogger<PositionManager> logger)
         {
             _logger = logger;

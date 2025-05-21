@@ -27,9 +27,9 @@
             <DockPanel LastChildFill="True">
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
                     <TextBlock VerticalAlignment="Center" Margin="0,0,5,0" Text="Service Status:"/>
-                    <Border x:Name="ServiceStatusIndicator" Width="15" Height="15" CornerRadius="7.5" 
+                    <Border x:Name="PipeStatusIndicator" Width="15" Height="15" CornerRadius="7.5" 
                             Background="Red" Margin="0,0,10,0"/>
-                    <TextBlock x:Name="ServiceStatusText" VerticalAlignment="Center" Text="Stopped"/>
+                    <TextBlock x:Name="PipeStatusTextBlock" VerticalAlignment="Center" Text="Stopped"/>
                 </StackPanel>
                 <TextBlock Text="ORF Log File Watcher" FontSize="20" FontWeight="Bold"/>
             </DockPanel>
@@ -53,28 +53,28 @@
                         <Expander Header="Database Connection" IsExpanded="True" Margin="0,0,0,10">
                             <StackPanel Margin="5">
                                 <TextBlock Text="Host / Server:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbHost" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
+                                <TextBox x:Name="DatabaseHost" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Port:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbPort" Text="5432" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
+                                <TextBox x:Name="DatabasePort" Text="5432" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Username:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbUsername" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
+                                <TextBox x:Name="DatabaseUsername" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Password:" Margin="0,5,0,2"/>
-                                <PasswordBox x:Name="DbPassword" Margin="0,0,0,5" PasswordChanged="DbPassword_Changed"/>
+                                <PasswordBox x:Name="DatabasePassword" Margin="0,0,0,5" PasswordChanged="DatabasePassword_Changed"/>
                                 
                                 <TextBlock Text="Database Name:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbName" Text="postgres" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
+                                <TextBox x:Name="DatabaseName" Text="postgres" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Schema:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbSchema" Text="public" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
+                                <TextBox x:Name="DatabaseSchema" Text="public" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Table Name:" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbTable" Text="orf_logs" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
+                                <TextBox x:Name="DatabaseTable" Text="orf_logs" Margin="0,0,0,5" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <TextBlock Text="Connection Timeout (seconds):" Margin="0,5,0,2"/>
-                                <TextBox x:Name="DbTimeout" Text="30" Margin="0,0,0,10" TextChanged="ConfigSetting_Changed"/>
+                                <TextBox x:Name="ConnectionTimeout" Text="30" Margin="0,0,0,10" TextChanged="ConfigSetting_Changed"/>
                                 
                                 <Button x:Name="TestConnectionBtn" Content="Test Connection" Style="{StaticResource MaterialDesignOutlinedButton}" 
                                         Margin="0,5,0,5" Click="TestConnectionBtn_Click"/>
@@ -110,9 +110,9 @@
                         <Expander Header="Service Control" IsExpanded="True" Margin="0,0,0,10">
                             <StackPanel Margin="5">
                                 <StackPanel Orientation="Horizontal" Margin="0,5">
-                                    <Button x:Name="InstallServiceBtn" Content="Install Service" Style="{StaticResource MaterialDesignOutlinedButton}" 
+                                    <Button x:Name="InstallBtn" Content="Install Service" Style="{StaticResource MaterialDesignOutlinedButton}" 
                                             Margin="0,0,5,0" Click="InstallServiceBtn_Click"/>
-                                    <Button x:Name="UninstallServiceBtn" Content="Uninstall Service" Style="{StaticResource MaterialDesignOutlinedButton}" 
+                                    <Button x:Name="UninstallBtn" Content="Uninstall Service" Style="{StaticResource MaterialDesignOutlinedButton}" 
                                             Click="UninstallServiceBtn_Click"/>
                                 </StackPanel>
                                 <StackPanel Orientation="Horizontal" Margin="0,5">
@@ -190,7 +190,7 @@
                             
                             <!-- Log Filter Controls -->
                             <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,5">
-                                <ToggleButton x:Name="ShowStatusToggle" Content="Status" IsChecked="True" 
+                                <ToggleButton x:Name="InfoFilterToggle" Content="Status" IsChecked="True" 
                                               Margin="0,0,5,0" Click="LogFilterToggle_Click">
                                     <ToggleButton.Style>
                                         <Style TargetType="ToggleButton" BasedOn="{StaticResource MaterialDesignOutlinedButton}">
@@ -204,7 +204,7 @@
                                         </Style>
                                     </ToggleButton.Style>
                                 </ToggleButton>
-                                <ToggleButton x:Name="ShowWarningsToggle" Content="Warnings" IsChecked="True" 
+                                <ToggleButton x:Name="WarningFilterToggle" Content="Warnings" IsChecked="True" 
                                               Margin="0,0,5,0" Click="LogFilterToggle_Click">
                                     <ToggleButton.Style>
                                         <Style TargetType="ToggleButton" BasedOn="{StaticResource MaterialDesignOutlinedButton}">
@@ -218,7 +218,7 @@
                                         </Style>
                                     </ToggleButton.Style>
                                 </ToggleButton>
-                                <ToggleButton x:Name="ShowErrorsToggle" Content="Errors" IsChecked="True" 
+                                <ToggleButton x:Name="ErrorFilterToggle" Content="Errors" IsChecked="True" 
                                               Margin="0,0,5,0" Click="LogFilterToggle_Click">
                                     <ToggleButton.Style>
                                         <Style TargetType="ToggleButton" BasedOn="{StaticResource MaterialDesignOutlinedButton}">

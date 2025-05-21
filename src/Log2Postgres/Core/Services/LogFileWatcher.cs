@@ -30,7 +30,7 @@ namespace Log2Postgres.Core.Services
 
         private readonly ILogger<LogFileWatcher> _logger;
         private readonly OrfLogParser _logParser;
-        private readonly PositionManager _positionManager;
+        private readonly PositionManager _positionManager = null!;
         private readonly PostgresService _postgresService;
         private readonly IOptionsMonitor<LogMonitorSettings> _optionsMonitor;
         private LogMonitorSettings CurrentSettings => _optionsMonitor.CurrentValue;
@@ -113,6 +113,7 @@ namespace Log2Postgres.Core.Services
 
             _isRunningAsHostedService = serviceSettingsOptions?.Value?.RunAsService ?? false;
             _logger.LogInformation("LogFileWatcher Constructor: _isRunningAsHostedService initialized to {IsRunningAsHostedServiceValue}", _isRunningAsHostedService);
+            _logger.LogInformation("LogFileWatcher Constructor: PositionManager reports positions file path: {PositionsPath}", _positionManager?.PositionsFilePathForDiagnostics);
         }
         
         // Helper method to notify UI about errors
@@ -1005,6 +1006,9 @@ namespace Log2Postgres.Core.Services
         /// <returns>Task representing the operation</returns>
         private async Task StartProcessingAsyncInternal()
         {
+            _logger.LogInformation("StartProcessingAsyncInternal ENTERED. IsRunningAsHostedService: {IsHostedService}, CurrentSettings.BaseDirectory: '{BaseDir}', CurrentSettings.LogFilePattern: '{Pattern}'", 
+                _isRunningAsHostedService, CurrentSettings.BaseDirectory, CurrentSettings.LogFilePattern);
+
             if (IsProcessing)
             {
                 _logger.LogWarning("Processing is already active, internal start request ignored.");
