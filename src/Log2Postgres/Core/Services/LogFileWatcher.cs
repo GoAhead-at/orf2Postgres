@@ -27,6 +27,8 @@ namespace Log2Postgres.Core.Services
         private CancellationTokenSource? _ipcServerCts;
         private StreamWriter? _ipcClientStreamWriter;
         private readonly object _ipcClientWriterLock = new object();
+        private readonly List<string> _bufferedLogEntries = new List<string>();
+        private TaskCompletionSource<bool> _ipcServerReadySignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         private readonly ILogger<LogFileWatcher> _logger;
         private readonly OrfLogParser _logParser;
@@ -57,7 +59,7 @@ namespace Log2Postgres.Core.Services
         public string CurrentDirectory => CurrentSettings.BaseDirectory;
         public string CurrentPattern => CurrentSettings.LogFilePattern;
         
-        private readonly CancellationTokenSource _stoppingCts = new();
+        private CancellationTokenSource _stoppingCts = new();
         private FileSystemWatcher? _fileSystemWatcher;
         
         // We'll use this to track the processing state in a thread-safe way
@@ -68,6 +70,25 @@ namespace Log2Postgres.Core.Services
         private string? _lastProcessingError = null;
         
         private readonly List<string> _pendingFiles = new();
+
+        private PipeSecurity CreatePipeSecurity()
+        {
+            PipeSecurity pipeSecurity = new PipeSecurity();
+            // Allow Authenticated Users to connect, read, and write.
+            // This is more permissive than InteractiveSid and usually works better for UI <-> Service.
+            SecurityIdentifier authenticatedUsersSid = new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null);
+            pipeSecurity.AddAccessRule(new PipeAccessRule(authenticatedUsersSid, PipeAccessRights.ReadWrite | PipeAccessRights.CreateNewInstance, AccessControlType.Allow));
+            
+            // Set the owner to NetworkService if the service runs as NetworkService (often default for new pipes by NS)
+            // Or set to Administrators for broader control during development/if UI runs elevated.
+            // For simplicity and general use, Authenticated Users should suffice for connectivity.
+            // If running service as NetworkService, it will be the owner.
+            // SecurityIdentifier owner = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
+            // pipeSecurity.SetOwner(owner);
+
+            _logger.LogDebug("PipeSecurity created for Authenticated Users (ReadWrite, CreateNewInstance).");
+            return pipeSecurity;
+        }
         
         public LogFileWatcher(
             ILogger<LogFileWatcher> logger,
@@ -653,184 +674,364 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         private async Task RunIpcServerAsync(CancellationToken cancellationToken)
         {
-            _logger.LogInformation("IPC Server starting. Pipe name: {PipeName}", PipeName);
-            while (!cancellationToken.IsCancellationRequested)
+            _logger.LogInformation("Starting IPC server on pipe '{PipeName}'...", PipeName);
+            try
             {
-                NamedPipeServerStream? pipeServer = null;
-                StreamWriter? sw = null;
-                try
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    // Define PipeSecurity
-                    PipeSecurity pipeSecurity = new PipeSecurity();
-                    SecurityIdentifier interactiveUserSid = new SecurityIdentifier(WellKnownSidType.InteractiveSid, null);
-                    pipeSecurity.AddAccessRule(new PipeAccessRule(interactiveUserSid, PipeAccessRights.ReadWrite, AccessControlType.Allow));
-
-                    // Ensure Network Service is the owner (it should be by default as the creator)
-                    // SecurityIdentifier networkServiceSid = new SecurityIdentifier(WellKnownSidType.NetworkServiceSid, null);
-                    // pipeSecurity.SetOwner(networkServiceSid); // Usually not needed if NetworkService creates it.
-
-                    _logger.LogInformation("IPC Server: PipeSecurity for InteractiveUser (ReadWrite) configured. Attempting to create pipe...");
-
-                    // Create the pipe server stream using NamedPipeServerStreamAcl.Create
-                    pipeServer = NamedPipeServerStreamAcl.Create(
+                    // Corrected NamedPipeServerStream creation using NamedPipeServerStreamAcl.Create
+                    NamedPipeServerStream serverStream = NamedPipeServerStreamAcl.Create(
                         PipeName,
                         PipeDirection.InOut,
-                        1, // MaxNumberOfServerInstances
+                        NamedPipeServerStream.MaxAllowedServerInstances,
                         PipeTransmissionMode.Byte,
                         PipeOptions.Asynchronous,
-                        0, // Default InBufferSize
-                        0, // Default OutBufferSize
-                        pipeSecurity);
+                        0, // Default in buffer size (usually 4096)
+                        0, // Default out buffer size (usually 4096)
+                        CreatePipeSecurity() // Apply PipeSecurity
+                    );
 
-                    _logger.LogInformation("IPC Server: NamedPipeServerStream created via ACL method. Waiting for a client connection...");
-
-                    await pipeServer.WaitForConnectionAsync(cancellationToken);
+                    _logger.LogDebug("IPC Server: Pipe stream created via ACL method. Waiting for a client connection...");
+                    await serverStream.WaitForConnectionAsync(cancellationToken);
                     _logger.LogInformation("IPC Server: Client connected.");
+                    _ipcServerReadySignal.TrySetResult(true); // Signal that server is ready and client connected
 
-                    sw = new StreamWriter(pipeServer) { AutoFlush = true };
-                    lock (_ipcClientWriterLock)
+                    // Client connected, handle communication
+                    _ipcClientStreamWriter = new StreamWriter(serverStream, Encoding.UTF8) { AutoFlush = true };
+                    var clientReader = new StreamReader(serverStream, Encoding.UTF8);
+
+                    try
                     {
-                        _ipcClientStreamWriter = sw;
-                    }
-                    _logger.LogInformation("IPC Server: Client StreamWriter stored and is now {Status}.", _ipcClientStreamWriter == null ? "NULL" : "NOT NULL");
-
-                    using var sr = new StreamReader(pipeServer);
-
-                    while (!cancellationToken.IsCancellationRequested && pipeServer.IsConnected)
-                    {
-                        string? message = await sr.ReadLineAsync(cancellationToken);
-                        if (message == null)
+                        while (!cancellationToken.IsCancellationRequested && serverStream.IsConnected)
                         {
-                            _logger.LogInformation("IPC Server: Client disconnected (message is null).");
-                            break; 
-                        }
-
-                        _logger.LogDebug("IPC Server: Received message: {Message}", message);
-
-                        if (message == "GET_STATUS")
-                        {
-                            var status = new ServiceStatus
+                            string? messageJson = await clientReader.ReadLineAsync(cancellationToken);
+                            if (messageJson == null)
                             {
-                                ServiceOperationalState = GetOperationalStateString(),
-                                IsProcessing = this.IsProcessing,
-                                CurrentFile = this.CurrentFile,
-                                CurrentPosition = this.CurrentPosition,
-                                TotalLinesProcessedSinceStart = this.TotalLinesProcessed,
-                                LastErrorMessage = _lastProcessingError ?? string.Empty
-                            };
-                            var ipcMessage = new IpcMessage<ServiceStatus> { Type = "SERVICE_STATUS", Payload = status };
-                            string jsonStatus = JsonConvert.SerializeObject(ipcMessage);
-                            await sw.WriteLineAsync(jsonStatus.AsMemory(), cancellationToken);
-                            _logger.LogDebug("IPC Server: Sent status to client: {Status}", jsonStatus);
+                                _logger.LogInformation("IPC Server: Client disconnected (null received).");
+                                break; // Client disconnected
+                            }
+                            // Restored call to ProcessIpcMessageAsync
+                            await ProcessIpcMessageAsync(messageJson, cancellationToken);
                         }
-                        else if (message.StartsWith("UPDATE_SETTINGS:"))
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        _logger.LogInformation("IPC Server: Operation cancelled during client communication.");
+                    }
+                    catch (IOException ex)
+                    {
+                        _logger.LogWarning(ex, "IPC Server: IOException during client communication (e.g., pipe broken).");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "IPC Server: Error during client communication.");
+                    }
+                    finally
+                    {
+                        _logger.LogInformation("IPC Server: Cleaning up client connection.");
+                        lock (_ipcClientWriterLock)
+                        {
+                            _ipcClientStreamWriter?.Dispose();
+                            _ipcClientStreamWriter = null;
+                        }
+                        clientReader.Dispose();
+                        if (serverStream.IsConnected) // Should be false if broken, but good practice
+                        {
+                            try { serverStream.Disconnect(); } catch (Exception exDisc) { _logger.LogWarning(exDisc, "IPC Server: Exception during serverStream.Disconnect()."); }
+                        }
+                        serverStream.Dispose();
+                        _logger.LogInformation("IPC Server: Client connection resources released.");
+                    }
+
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        _logger.LogInformation("IPC Server: Cancellation requested after client handling, breaking server loop.");
+                        _ipcServerReadySignal.TrySetCanceled(cancellationToken); // Reflect cancellation if it occurs before connection
+                        break;
+                    }
+                    // After client disconnects, loop to wait for a new connection
+                    _logger.LogInformation("IPC Server: Client disconnected, looping to wait for new connection.");
+                    // Reset the ready signal for the next connection if UIManagedStartProcessingAsync can be called multiple times
+                    // or if it's intended to signal each client connection. For now, it signals first successful server setup.
+                    // If _ipcServerReadySignal is awaited by UIManagedStartProcessingAsync only once per start, 
+                    // then this TrySetResult(true) is for that initial setup. Subsequent connections won't re-trigger it unless reset.
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                _logger.LogInformation("IPC server task cancelled.");
+                _ipcServerReadySignal.TrySetCanceled(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Critical error in IPC server task.");
+                _ipcServerReadySignal.TrySetException(ex); 
+            }
+            finally
+            {
+                _logger.LogInformation("IPC server task shutting down.");
+            }
+        }
+
+        // Restored ProcessIpcMessageAsync method
+        private async Task ProcessIpcMessageAsync(string messageJson, CancellationToken cancellationToken)
+        {
+            try
+            {
+                _logger.LogDebug("IPC Server: Received message: {MessageJson}", messageJson);
+                var baseMessage = JsonConvert.DeserializeObject<IpcMessage<object>>(messageJson);
+
+                if (baseMessage == null || string.IsNullOrEmpty(baseMessage.Type))
+                {
+                    _logger.LogWarning("IPC Server: Received an invalid or untyped IPC message: {MessageJson}", messageJson);
+                    return;
+                }
+
+                _logger.LogDebug("IPC Server: Processing command of Type: {CommandType}", baseMessage.Type);
+
+                switch (baseMessage.Type)
+                {
+                    case "RequestStatus":
+                        _logger.LogDebug("IPC Server: Handling 'RequestStatus' command.");
+                        var statusPayload = new ServiceStatus // Using the internal ServiceStatus class for payload
+                        {
+                            ServiceOperationalState = GetOperationalStateString(),
+                            IsProcessing = this.IsProcessing,
+                            CurrentFile = this.CurrentFile,
+                            CurrentPosition = this.CurrentPosition,
+                            TotalLinesProcessedSinceStart = this.TotalLinesProcessed,
+                            LastErrorMessage = _lastProcessingError ?? string.Empty
+                        };
+                        var responseMessage = new IpcMessage<ServiceStatus> { Type = "ServiceStatus", Payload = statusPayload };
+                        string jsonResponse = JsonConvert.SerializeObject(responseMessage);
+                         if (_ipcClientStreamWriter != null)
+                        {
+                            await _ipcClientStreamWriter.WriteLineAsync(jsonResponse.AsMemory(), cancellationToken);
+                            _logger.LogInformation("IPC Server: Sent 'ServiceStatus' response to client: {JsonResponse}", jsonResponse);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("IPC Server: _ipcClientStreamWriter is null, cannot send 'ServiceStatus' response.");
+                        }
+                        break;
+
+                    case "UpdateSettings":
+                        _logger.LogDebug("IPC Server: Handling 'UpdateSettings' command.");
+                        if (baseMessage.Payload != null)
                         {
                             try
                             {
-                                string settingsJson = message.Substring("UPDATE_SETTINGS:".Length);
-                                var settings = JsonConvert.DeserializeObject<LogMonitorSettings>(settingsJson);
+                                var settings = JsonConvert.DeserializeObject<LogMonitorSettings>(baseMessage.Payload.ToString() ?? string.Empty);
                                 if (settings != null)
                                 {
-                                    _logger.LogInformation("IPC Server: Received UPDATE_SETTINGS request. Applying new settings.");
-                                    await UpdateSettingsAsync(settings);
-                                    await sw.WriteLineAsync("SETTINGS_UPDATED_ACK".AsMemory(), cancellationToken);
+                                    _logger.LogInformation("IPC Server: Received UpdateSettings request. Applying new settings.");
+                                    await UpdateSettingsAsync(settings); // Assuming this method exists and works
+                                    // Acknowledge the settings update
+                                     if (_ipcClientStreamWriter != null)
+                                    {
+                                        var ackPayload = new { Status = "OK", Message = "Settings updated successfully." };
+                                        var ackResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateAck", Payload = ackPayload };
+                                        await _ipcClientStreamWriter.WriteLineAsync(JsonConvert.SerializeObject(ackResponseMessage).AsMemory(), cancellationToken);
+                                    }
                                 }
                                 else
                                 {
-                                    _logger.LogWarning("IPC Server: Failed to deserialize settings from UPDATE_SETTINGS message.");
-                                    await sw.WriteLineAsync("SETTINGS_UPDATE_ERROR_DESERIALIZATION".AsMemory(), cancellationToken);
+                                    _logger.LogWarning("IPC Server: Failed to deserialize LogMonitorSettings from UpdateSettings command payload.");
+                                     if (_ipcClientStreamWriter != null)
+                                    {
+                                        var errPayload = new { Status = "Error", Message = "Failed to deserialize settings." };
+                                        var errResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateNack", Payload = errPayload };
+                                        await _ipcClientStreamWriter.WriteLineAsync(JsonConvert.SerializeObject(errResponseMessage).AsMemory(), cancellationToken);
+                                    }
                                 }
                             }
                             catch (Exception ex)
                             {
-                                _logger.LogError(ex, "IPC Server: Error processing UPDATE_SETTINGS.");
-                                await sw.WriteLineAsync($"SETTINGS_UPDATE_ERROR:{ex.Message}".AsMemory(), cancellationToken);
+                                _logger.LogError(ex, "IPC Server: Error processing UpdateSettings command.");
+                                if (_ipcClientStreamWriter != null)
+                                {
+                                    var errPayload = new { Status = "Error", Message = $"Error processing settings: {ex.Message}" };
+                                    var errResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateNack", Payload = errPayload };
+                                    await _ipcClientStreamWriter.WriteLineAsync(JsonConvert.SerializeObject(errResponseMessage).AsMemory(), cancellationToken);
+                                }
                             }
-                        }
-                    }
-                }
-                catch (OperationCanceledException)
-                {
-                    _logger.LogInformation("IPC Server: Operation cancelled.");
-                }
-                catch (IOException ioEx)
-                {
-                    _logger.LogWarning(ioEx, "IPC Server: IOException (client likely disconnected).");
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "IPC Server: Unhandled exception in server loop.");
-                }
-                finally
-                {
-                    _logger.LogInformation("IPC Server: Client session ending.");
-                    lock (_ipcClientWriterLock)
-                    {
-                        if (_ipcClientStreamWriter == sw) // Check if it's the same writer instance
-                        {
-                            _ipcClientStreamWriter = null;
-                            _logger.LogInformation("IPC Server: Client StreamWriter nulled out.");
                         }
                         else
                         {
-                            _logger.LogInformation("IPC Server: Client StreamWriter was already different or null. Current writer is {Status}", _ipcClientStreamWriter == null ? "NULL" : "NOT NULL (different instance)");
+                             _logger.LogWarning("IPC Server: 'UpdateSettings' command received with null payload.");
+                             if (_ipcClientStreamWriter != null)
+                             {
+                                var errPayload = new { Status = "Error", Message = "UpdateSettings payload was null." };
+                                var errResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateNack", Payload = errPayload };
+                                await _ipcClientStreamWriter.WriteLineAsync(JsonConvert.SerializeObject(errResponseMessage).AsMemory(), cancellationToken);
+                             }
                         }
-                    }
-                    if (sw != null) { try { await sw.DisposeAsync(); } catch { /* ignored */ } }
-                    if (pipeServer != null) 
-                    { 
-                        if (pipeServer.IsConnected) { try { pipeServer.Disconnect(); } catch { /* ignored */ } }
-                        try { await pipeServer.DisposeAsync(); } catch { /* ignored */ } 
-                    }
-                    if (!cancellationToken.IsCancellationRequested) { await Task.Delay(1000, cancellationToken); }
+                        break;
+                    
+                    default:
+                        _logger.LogWarning("IPC Server: Unknown or unhandled command type received: {MessageType} from message: {RawMessage}", baseMessage.Type, messageJson);
+                        break;
                 }
             }
-            _logger.LogInformation("IPC Server task exiting.");
+            catch (JsonException jsonEx)
+            {
+                _logger.LogError(jsonEx, "IPC Server: JSON deserialization error in ProcessIpcMessageAsync for message: {MessageJson}", messageJson);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "IPC Server: Error processing IPC message: {MessageJson}", messageJson);
+            }
         }
 
         private async Task SendLogEntriesToIpcClientAsync(IEnumerable<OrfLogEntry> entries)
         {
+            var logMessages = entries.Select(e => e.EventMsg ?? string.Empty).Where(s => !string.IsNullOrEmpty(s)).ToList();
+            if (!logMessages.Any())
+            {
+                _logger.LogDebug("IPC SendLogEntries: No valid log messages to send after filtering.");
+                return;
+            }
+
             StreamWriter? writer;
+            bool clientConnectedThisCall;
             lock (_ipcClientWriterLock)
             {
                 writer = _ipcClientStreamWriter;
+                clientConnectedThisCall = writer != null;
+
+                if (!clientConnectedThisCall)
+                {
+                    _logger.LogDebug("IPC SendLogEntries: No client connected, buffering {Count} log entries.", logMessages.Count);
+                    _bufferedLogEntries.AddRange(logMessages);
+                    // Optional: Limit buffer size if necessary
+                    // if (_bufferedLogEntries.Count > MAX_BUFFER_SIZE) { /* trim buffer */ }
+                    return; // Buffered, so exit
+                }
             }
             _logger.LogDebug("IPC SendLogEntries: Entered method. Writer is {WriterStatus}.", writer == null ? "NULL" : "NOT NULL");
 
-            if (writer != null)
+            // If we reach here, client was connected at the start of the call (writer != null)
+            // No need to re-check writer == null directly, but operations might fail if it disconnects.
+            
+            List<string> messagesToSend = new List<string>(); // Declare messagesToSend here
+
+            try
+            {
+                // Attempt to send buffered messages first, if any.
+                // This part needs to be careful about re-acquiring lock or ensuring writer is still valid.
+                // For simplicity, we'll assume if writer was good at start, it's good for this batch.
+                // A more robust solution might involve a sending queue processed by a dedicated task.
+
+                if (_bufferedLogEntries.Any())
+                {
+                    lock(_ipcClientWriterLock) // Lock when accessing shared buffer
+                    {
+                        if(_ipcClientStreamWriter == writer) // Ensure writer is still the same one we latched
+                        {
+                             messagesToSend.AddRange(_bufferedLogEntries);
+                            _bufferedLogEntries.Clear();
+                            _logger.LogInformation("IPC SendLogEntries: Sending {Count} previously buffered log entries.", messagesToSend.Count);
+                        }
+                        else // Writer changed or became null, re-buffer
+                        {
+                            _logger.LogWarning("IPC SendLogEntries: Client writer changed while trying to send buffered logs. Re-buffering all.");
+                            _bufferedLogEntries.InsertRange(0, messagesToSend); // Put them back at the start
+                            _bufferedLogEntries.AddRange(logMessages); // Add current messages too
+                            return; // Exit, will try again later
+                        }
+                    }
+                }
+                messagesToSend.AddRange(logMessages); // Add current batch
+
+                if (!messagesToSend.Any())
+                {
+                    _logger.LogDebug("IPC SendLogEntries: No messages to send (current or buffered).");
+                    return;
+                }
+
+                var ipcMessage = new IpcMessage<List<string>> { Type = "LOG_ENTRIES", Payload = messagesToSend };
+                string jsonMessage = JsonConvert.SerializeObject(ipcMessage);
+                _logger.LogDebug("IPC SendLogEntries: Attempting to send JSON for {Count} total entries: {JsonMessage}", messagesToSend.Count, jsonMessage);
+                
+                // The 'writer' variable was captured outside the lock specific to buffered entries.
+                // Re-evaluate or ensure its validity if sending takes long or involves yielding.
+                // For now, assume it's still valid if we got this far.
+                await writer!.WriteLineAsync(jsonMessage.AsMemory(), _stoppingCts.Token); 
+                _logger.LogInformation("IPC: Sent {Count} total log entries to client. JSON: {JsonMessage}", messagesToSend.Count, jsonMessage);
+            }
+            catch (IOException ioEx) 
+            {
+                _logger.LogWarning(ioEx, "IPC SendLogEntries: IOException sending log entries. Nulling out writer and re-buffering if applicable.");
+                // Re-buffer unsent messages if possible (messagesToSend still holds them)
+                lock (_ipcClientWriterLock) 
+                { 
+                    if (_ipcClientStreamWriter == writer) _ipcClientStreamWriter = null; 
+                    _bufferedLogEntries.InsertRange(0, messagesToSend); // Put them back
+                }
+            }
+            catch (OperationCanceledException) 
+            { 
+                _logger.LogInformation("IPC SendLogEntries: Operation cancelled sending log entries."); 
+                // Re-buffer unsent messages
+                lock (_ipcClientWriterLock) { _bufferedLogEntries.InsertRange(0, messagesToSend); }
+            }
+            catch (Exception ex) 
+            { 
+                _logger.LogError(ex, "IPC SendLogEntries: Error sending log entries. Re-buffering. Writer state unchanged unless it was the cause."); 
+                lock (_ipcClientWriterLock) { _bufferedLogEntries.InsertRange(0, messagesToSend); }
+            }
+        }
+
+        // New method to flush buffered log entries
+        private async Task FlushBufferedLogEntriesAsync(StreamWriter writer)
+        {
+            List<string> entriesToFlush = new List<string>();
+            lock (_ipcClientWriterLock)
+            {
+                // Ensure the provided writer is still the active one
+                if (_ipcClientStreamWriter == writer && _bufferedLogEntries.Any())
+                {
+                    entriesToFlush.AddRange(_bufferedLogEntries);
+                    _bufferedLogEntries.Clear();
+                    _logger.LogInformation("IPC FlushBuffered: Preparing to flush {Count} buffered log entries.", entriesToFlush.Count);
+                }
+                else if (_ipcClientStreamWriter != writer)
+                {
+                    _logger.LogWarning("IPC FlushBuffered: Active writer changed, cannot flush with stale writer. Entries remain buffered.");
+                    return;
+                }
+                else
+                {
+                     _logger.LogDebug("IPC FlushBuffered: No buffered entries to flush.");
+                    return;
+                }
+            }
+
+            if (entriesToFlush.Any())
             {
                 try
                 {
-                    var logMessages = entries.Select(e => e.EventMsg ?? string.Empty).ToList();
-                    if (!logMessages.Any())
-                    {
-                        _logger.LogDebug("IPC SendLogEntries: No log messages to send.");
-                        return;
-                    }
-
-                    var ipcMessage = new IpcMessage<List<string>> { Type = "LOG_ENTRIES", Payload = logMessages };
+                    var ipcMessage = new IpcMessage<List<string>> { Type = "LOG_ENTRIES", Payload = entriesToFlush };
                     string jsonMessage = JsonConvert.SerializeObject(ipcMessage);
-                    _logger.LogDebug("IPC SendLogEntries: Attempting to send JSON: {JsonMessage}", jsonMessage);
-                    await writer.WriteLineAsync(jsonMessage.AsMemory(), _stoppingCts.Token); 
-                    _logger.LogInformation("IPC: Sent {Count} log entries to client. JSON: {JsonMessage}", logMessages.Count, jsonMessage); // Changed to LogInformation for successful send
+                    _logger.LogDebug("IPC FlushBuffered: Attempting to send JSON for {Count} entries: {JsonMessage}", entriesToFlush.Count, jsonMessage);
+                    await writer.WriteLineAsync(jsonMessage.AsMemory(), _stoppingCts.Token);
+                    _logger.LogInformation("IPC FlushBuffered: Flushed {Count} buffered log entries to client.", entriesToFlush.Count);
                 }
-                catch (IOException ioEx) 
+                catch (IOException ioEx)
                 {
-                    _logger.LogWarning(ioEx, "IPC SendLogEntries: IOException sending log entries. Nulling out writer.");
-                    lock (_ipcClientWriterLock) { if (_ipcClientStreamWriter == writer) _ipcClientStreamWriter = null; }
+                    _logger.LogWarning(ioEx, "IPC FlushBuffered: IOException flushing entries. Re-buffering.");
+                    lock (_ipcClientWriterLock) { _bufferedLogEntries.InsertRange(0, entriesToFlush); } // Put them back
                 }
-                catch (OperationCanceledException) 
-                { 
-                    _logger.LogInformation("IPC SendLogEntries: Operation cancelled sending log entries."); 
+                catch (OperationCanceledException)
+                {
+                    _logger.LogInformation("IPC FlushBuffered: Operation cancelled. Re-buffering.");
+                    lock (_ipcClientWriterLock) { _bufferedLogEntries.InsertRange(0, entriesToFlush); }
                 }
-                catch (Exception ex) 
-                { 
-                    _logger.LogError(ex, "IPC SendLogEntries: Error sending log entries. Writer state unchanged unless it was the cause."); 
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "IPC FlushBuffered: Error flushing entries. Re-buffering.");
+                    lock (_ipcClientWriterLock) { _bufferedLogEntries.InsertRange(0, entriesToFlush); }
                 }
-            }
-            else
-            {
-                _logger.LogWarning("IPC SendLogEntries: StreamWriter is null, cannot send log entries.");
             }
         }
 
@@ -1045,52 +1246,64 @@ namespace Log2Postgres.Core.Services
         // New method for UI-initiated start
         public async Task UIManagedStartProcessingAsync()
         {
+            _logger.LogInformation("UIManagedStartProcessingAsync called.");
+
             if (_isRunningAsHostedService)
             {
-                _logger.LogWarning("Application is running as a hosted service. UI cannot directly start processing. Use IPC (not yet implemented).");
-                NotifyError("Service Control", "Cannot start from UI when running as a dedicated service. Control via service management or IPC.");
+                _logger.LogWarning("UIManagedStartProcessingAsync called, but LogFileWatcher is configured to run as a hosted service. UI should not manage it directly.");
+                NotifyError("Startup", "Service is configured to run as a Windows Service. UI cannot start local processing.");
                 return;
             }
 
             if (IsProcessing)
             {
-                _logger.LogWarning("Processing is already running (UI mode), ignoring start request.");
+                _logger.LogWarning("UIManagedStartProcessingAsync: Processing is already active.");
                 return;
             }
 
-            _logger.LogWarning("UIManagedStartProcessingAsync: DIAGNOSTIC - Checking BaseDirectory. Current value from IOptionsMonitor.CurrentValue.BaseDirectory: '{MonitorBaseDir}'", CurrentSettings.BaseDirectory);
+            // Reset the ready signal for this start attempt - this might still be useful internally for the IPC server
+            _ipcServerReadySignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-            if (string.IsNullOrWhiteSpace(CurrentSettings.BaseDirectory))
+            _logger.LogInformation("UIManagedStartProcessingAsync: Performing initial setup...");
+            // Ensure _stoppingCts is fresh if this can be called multiple times after stops
+            if (_stoppingCts.IsCancellationRequested)
             {
-                _logger.LogWarning("Cannot start processing - no directory configured (UI mode). IOptionsMonitor.CurrentValue.BaseDirectory was: '{MonitorBaseDir}'", CurrentSettings.BaseDirectory);
+                _logger.LogInformation("UIManagedStartProcessingAsync: Previous _stoppingCts was cancelled. Creating a new one.");
+                _stoppingCts = new CancellationTokenSource();
+            }
+            await InitialSetupAsync(_stoppingCts.Token); 
 
-                NotifyError("Configuration", "Log directory is not configured. Please configure a directory first.");
+            if (_stoppingCts.IsCancellationRequested)
+            {
+                _logger.LogWarning("UIManagedStartProcessingAsync: Cancellation requested during initial setup.");
                 return;
             }
-            
-            if (!Directory.Exists(CurrentSettings.BaseDirectory))
+
+            _logger.LogInformation("UIManagedStartProcessingAsync: Starting internal processing logic...");
+            // StartProcessingAsyncInternal also awaits InitializeAndProcessFilesOnStartAsync,
+            // which can take time. Consider if this needs to be offloaded if it blocks UI too long.
+            // For now, let's assume it's acceptable or that its internal awaits are well-behaved.
+            await StartProcessingAsyncInternal(); 
+
+            if (!IsProcessing)
             {
-                _logger.LogWarning("Cannot start processing - directory {Directory} does not exist (UI mode)", CurrentSettings.BaseDirectory);
-                NotifyError("File System", $"Directory {CurrentSettings.BaseDirectory} does not exist. Please check the configuration.");
+                _logger.LogError("UIManagedStartProcessingAsync: StartProcessingAsyncInternal did not result in IsProcessing being true. Aborting IPC server start.");
+                NotifyError("Startup", "Failed to start internal processing components.");
                 return;
             }
 
-            if (!_positionManager.PositionsFileExists())
-            {
-                _logger.LogWarning("Positions file doesn't exist at UI start. Will create a new one.");
-            }
+            _logger.LogInformation("UIManagedStartProcessingAsync: Starting IPC server task.");
+            // Ensure _ipcServerCts is fresh
+            _ipcServerCts?.Cancel(); // Cancel previous if any
+            _ipcServerCts = new CancellationTokenSource();
+            _ipcServerTask = Task.Run(() => RunIpcServerAsync(_ipcServerCts.Token), _ipcServerCts.Token);
 
-            IsProcessing = true;
-            _logger.LogInformation("Log file processing started by UI. IsProcessing: {IsProcessing}", IsProcessing);
-            
-            await InitializeAndProcessFilesOnStartAsync(_stoppingCts.Token);
-            
-            _logger.LogInformation("UI-initiated processing started and initial files processed.");
-            if (!_isRunningAsHostedService)
-            {
-                _logger.LogInformation("UI Mode: Kicking off PollingLoopAsync as ExecuteAsync is not managing it.");
-                 _ = Task.Run(() => PollingLoopAsync(_stoppingCts.Token), _stoppingCts.Token);
-            }
+            // DO NOT await _ipcServerReadySignal.Task here.
+            // The UI will attempt to connect via IpcService and ServiceStatusTimer_Tick.
+            // The IPC server will become "ready" when a client connects.
+            _logger.LogInformation("UIManagedStartProcessingAsync: IPC server started in background. UI will connect separately. IsProcessing: {IsProcessingState}", IsProcessing);
+            // The method now returns quickly. MainWindow should update its UI based on IsProcessing
+            // and the IpcService connection status.
         }
         
         // Helper for initializing files on start (used by both service auto-start and UI start)
@@ -1138,23 +1351,63 @@ namespace Log2Postgres.Core.Services
         // New method for UI-initiated stop
         public void UIManagedStopProcessing()
         {
+            _logger.LogInformation("UIManagedStopProcessing called.");
             if (_isRunningAsHostedService)
             {
-                _logger.LogWarning("Application is running as a hosted service. UI cannot directly stop processing. Use IPC (not yet implemented).");
-                NotifyError("Service Control", "Cannot stop from UI when running as a dedicated service. Control via service management or IPC.");
+                _logger.LogWarning("UIManagedStopProcessing called, but LogFileWatcher is configured to run as a hosted service. UI should not manage it directly.");
                 return;
             }
 
-            if (!IsProcessing)
+            if (!IsProcessing && (_ipcServerTask == null || _ipcServerTask.IsCompleted))
             {
-                _logger.LogWarning("Processing is not currently active (UI mode), ignoring stop request.");
+                _logger.LogWarning("UIManagedStopProcessing: Processing and IPC server are not active or already stopped.");
+                // Ensure IsProcessing is false if we reach here unexpectedly
+                if (IsProcessing) IsProcessing = false;
                 return;
             }
+
+            _logger.LogInformation("UIManagedStopProcessing: Stopping internal processing...");
+            if (!_stoppingCts.IsCancellationRequested)
+            {
+                _stoppingCts.Cancel(); // Signal polling loop and other internal processes to stop
+            }
+            // Note: StartProcessingAsyncInternal uses _stoppingCts.Token, so this should halt its operations.
+            // FileSystemWatcher is disposed by StopAsync if it's a full service stop, or should be handled if UIManaged stop needs it.
+            // For now, FSW is managed by SetupFileSystemWatcherAsync and disposed/recreated there or during full StopAsync.
+
+            if (_ipcServerCts != null && !_ipcServerCts.IsCancellationRequested)
+            {
+                _logger.LogInformation("UIManagedStopProcessing: Cancelling IPC server task...");
+                _ipcServerCts.Cancel();
+            }
+
+            // It might be good to wait for _ipcServerTask to complete, with a timeout.
+            // For now, just cancelling. Proper cleanup of the task should occur in RunIpcServerAsync's finally block.
 
             IsProcessing = false;
-            _logger.LogInformation("Log file processing stopped by UI. IsProcessing: {IsProcessing}", IsProcessing);
-            
-            ResetPositionInfo();
+            CurrentFile = string.Empty;
+            CurrentPosition = 0;
+            // TotalLinesProcessed is not reset here, it's a cumulative count for the session/instance.
+
+            // Reset _stoppingCts for the next potential start via UIManagedStartProcessingAsync
+            // _stoppingCts = new CancellationTokenSource(); // This was in StopAsync, consider if needed here.
+            // For UI managed start/stop, _stoppingCts should ideally be fresh per Start operation.
+            // However, if ExecuteAsync is also using it for a PollingLoopAsync that runs regardless of UI start/stop, then it's more complex.
+            // Given UIManagedStartProcessingAsync passes _stoppingCts.Token to InitialSetupAsync and StartProcessingAsyncInternal,
+            // it seems _stoppingCts is indeed meant for the lifetime of a processing session initiated by UI or service start.
+            // It gets cancelled on StopAsync (service) or UIManagedStopProcessing (UI).
+            // It should be re-created before the next UIManagedStartProcessingAsync or ExecuteAsync call that uses it.
+            // Let's assume the _stoppingCts used in UIManagedStartProcessingAsync is this class's main _stoppingCts.
+            // The original _stoppingCts is created with `new()` when the class is instantiated. 
+            // It's passed to ExecuteAsync. ExecuteAsync registers on it. 
+            // UIManagedStart uses it. StopAsync cancels it. UIManagedStopProcessing cancels it.
+            // This means after a stop (either service or UI), the main _stoppingCts is cancelled.
+            // If UIManagedStartProcessingAsync is called again, it will use an already cancelled token for InitialSetup and StartProcessingInternal.
+            // This is a bug. _stoppingCts needs to be fresh for each processing session (UI managed or service start).
+            // Let's fix this in Start/Stop methods more broadly.
+
+            _logger.LogInformation("UIManagedStopProcessing: Completed.");
+            ProcessingStatusChanged?.Invoke(CurrentFile, TotalLinesProcessed, CurrentPosition); // Notify UI of stopped state
         }
 
         private string GetOperationalStateString()

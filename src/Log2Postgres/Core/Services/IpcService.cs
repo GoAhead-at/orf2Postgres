@@ -1,12 +1,14 @@
 using Microsoft.Extensions.Logging;
 using System;
+using System.Collections.Generic; // Added for List<string>
 using System.IO;
 using System.IO.Pipes;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Log2Postgres.Core.Models; // Assuming LogMonitorSettings is here
+using Log2Postgres.Core.Models;
 using Newtonsoft.Json;
+using System.Security.Principal;
 
 namespace Log2Postgres.Core.Services
 {
@@ -26,9 +28,20 @@ namespace Log2Postgres.Core.Services
         public long CurrentPosition { get; set; }
         public long TotalLinesProcessedSinceStart { get; set; }
         public string LastErrorMessage { get; set; } = string.Empty;
-        // For consistency with commands, let's add Type, though not strictly needed for status object itself
-        public string Type { get; set; } = "ServiceStatus";
+        public string Type { get; set; } = "ServiceStatus"; // Matches IpcMessageTypes.StatusUpdate now
     }
+
+    // Placeholder for a more detailed LogEntry if needed.
+    // For now, LogEntriesReceived uses List<string>.
+    // public class LogEntry { public string Message { get; set; } }
+
+    // Placeholder for ServiceStateSnapshot
+    public class ServiceStateSnapshot
+    {
+        public string SomeStateProperty { get; set; } = string.Empty;
+        // Add other relevant properties
+    }
+
 
     public interface IIpcService
     {
@@ -42,169 +55,239 @@ namespace Log2Postgres.Core.Services
         event Func<PipeServiceStatus, Task>? ServiceStatusReceived;
         event Func<Task>? PipeConnected;
         event Func<Task>? PipeDisconnected;
-        event Func<List<string>, Task>? LogEntriesReceived;
+        event Func<List<string>, Task>? LogEntriesReceived; // Expects a list of strings
+        event Func<ServiceStateSnapshot, Task>? StateSnapshotReceived; // New event for state snapshots
     }
 
     public class IpcService : IIpcService, IAsyncDisposable
     {
-        private const string PipeName = "Log2PostgresServicePipe";
         private readonly ILogger<IpcService> _logger;
-        
         private NamedPipeClientStream? _pipeClient;
         private StreamReader? _pipeReader;
         private StreamWriter? _pipeWriter;
-        private CancellationTokenSource? _listenerCts;
-        private Task? _listenerTask;
-        private readonly SemaphoreSlim _pipeLock = new SemaphoreSlim(1, 1); // Using SemaphoreSlim for async locking
-
+        private Task? _receiveTask;
+        private CancellationTokenSource? _receiveCts;
         private bool _isConnected = false;
-        public bool IsConnected => _isConnected;
+        private readonly string _pipeName;
+        private readonly object _lock = new object();
 
         public event Func<PipeServiceStatus, Task>? ServiceStatusReceived;
         public event Func<Task>? PipeConnected;
         public event Func<Task>? PipeDisconnected;
         public event Func<List<string>, Task>? LogEntriesReceived;
+        public event Func<ServiceStateSnapshot, Task>? StateSnapshotReceived;
 
-        public IpcService(ILogger<IpcService> logger)
+
+        public bool IsConnected => _isConnected && (_pipeClient?.IsConnected ?? false);
+
+        public IpcService(ILogger<IpcService> logger, string pipeName = "Log2PostgresServicePipe")
         {
             _logger = logger;
-            _logger.LogInformation("IpcService created.");
+            _pipeName = pipeName;
+            _logger.LogInformation("IpcService initialized for pipe: {PipeName}", _pipeName);
         }
 
         public async Task ConnectAsync(CancellationToken cancellationToken = default)
         {
-            if (_isConnected)
+            if (IsConnected)
             {
-                _logger.LogInformation("Already connected to service pipe.");
+                _logger.LogInformation("Already connected.");
                 return;
             }
 
-            await _pipeLock.WaitAsync(cancellationToken);
-            try
-            {
-                if (_isConnected) return;
+            _logger.LogInformation("Attempting to connect to IPC pipe '{PipeName}'...", _pipeName);
+            int attempt = 0;
+            int maxAttempts = 3; 
+            int delayMs = 1000;  
+            int timeout = 5000; 
 
-                _logger.LogInformation("Attempting to connect to service pipe '{PipeName}'...", PipeName);
-                _pipeClient = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-                
+            while (attempt < maxAttempts && !cancellationToken.IsCancellationRequested)
+            {
+                attempt++;
+                _logger.LogDebug("Connection attempt {Attempt} of {MaxAttempts}", attempt, maxAttempts);
+
                 try
                 {
-                    await _pipeClient.ConnectAsync(5000, cancellationToken); // 5-second timeout
-                    _logger.LogInformation("Successfully connected to service pipe '{PipeName}'.", PipeName);
+                    lock (_lock)
+                    {
+                        if (_pipeClient != null)
+                        {
+                            _pipeReader?.Dispose();
+                            _pipeWriter?.Dispose();
+                            _pipeClient.Dispose();
+                        }
+
+                        _pipeClient = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+                    }
+                    
+                    _logger.LogDebug("Attempting to connect with timeout {Timeout}ms...", timeout);
+                    await _pipeClient.ConnectAsync(timeout, cancellationToken).ConfigureAwait(false);
+                    _logger.LogInformation("Successfully connected to IPC pipe '{PipeName}'.", _pipeName);
+
+                    lock (_lock)
+                    {
+                        _pipeReader = new StreamReader(_pipeClient);
+                        _pipeWriter = new StreamWriter(_pipeClient) { AutoFlush = false }; 
+                    }
+
+                    _isConnected = true;
+                    _receiveCts = new CancellationTokenSource();
+                    _receiveTask = StartListeningAsync(_receiveCts.Token);
+
+                    _logger.LogInformation("IPC client connected and listener started.");
+                    if (PipeConnected != null) // Check for null before invoking
+                    {
+                        await PipeConnected.Invoke().ConfigureAwait(false);
+                    }
+                    return; 
                 }
-                catch (TimeoutException ex)
+                catch (TimeoutException tex)
                 {
-                    _logger.LogWarning(ex, "Timeout connecting to service pipe '{PipeName}'. Service might not be running or available.", PipeName);
-                    await CleanupPipeResourcesAsync(); // Clean up the partially opened client
-                    throw; // Re-throw to indicate connection failure
+                    _logger.LogWarning(tex, "Timeout connecting to IPC pipe '{PipeName}' on attempt {Attempt}.", _pipeName, attempt);
+                    if (attempt >= maxAttempts)
+                    {
+                        _logger.LogError("Max connection attempts reached. Giving up.");
+                        await DisconnectAsyncInternal().ConfigureAwait(false);
+                        throw; 
+                    }
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Error connecting to service pipe '{PipeName}'.", PipeName);
-                    await CleanupPipeResourcesAsync();
-                    throw; // Re-throw
+                    _logger.LogError(ex, "Error connecting to IPC pipe '{PipeName}' on attempt {Attempt}.", _pipeName, attempt);
+                    if (attempt >= maxAttempts)
+                    {
+                        _logger.LogError("Max connection attempts reached after other error. Giving up.");
+                        await DisconnectAsyncInternal().ConfigureAwait(false);
+                        throw; 
+                    }
                 }
-
-                _pipeReader = new StreamReader(_pipeClient, Encoding.UTF8);
-                _pipeWriter = new StreamWriter(_pipeClient, Encoding.UTF8) { AutoFlush = true };
-
-                _listenerCts = new CancellationTokenSource();
-                _listenerTask = Task.Run(() => StartListeningAsync(_listenerCts.Token), cancellationToken);
                 
-                _isConnected = true;
-                PipeConnected?.Invoke();
-                _logger.LogInformation("IPC Service Listener started.");
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                     _logger.LogDebug("Waiting {DelayMs}ms before next connection attempt.", delayMs);
+                    await Task.Delay(delayMs, cancellationToken).ConfigureAwait(false);
+                    delayMs *= 2; 
+                }
             }
-            catch (Exception ex)
+            if (cancellationToken.IsCancellationRequested)
             {
-                _logger.LogError(ex, "Failed to establish IPC connection.");
-                await CleanupPipeResourcesAsync(); // Ensure cleanup on any connection setup failure
-                throw; // Re-throw the exception to the caller
-            }
-            finally
-            {
-                _pipeLock.Release();
+                _logger.LogInformation("Connection cancelled.");
             }
         }
-        
+
         private async Task StartListeningAsync(CancellationToken cancellationToken)
         {
             _logger.LogInformation("IPC listener task started. Waiting for messages...");
             try
             {
-                while (!cancellationToken.IsCancellationRequested && _pipeReader != null)
+                while (!cancellationToken.IsCancellationRequested && _pipeReader != null && (_pipeClient?.IsConnected ?? false) )
                 {
-                    string? messageJson = await _pipeReader.ReadLineAsync(cancellationToken);
+                    string? messageJson = await _pipeReader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
                     if (messageJson == null)
                     {
-                        _logger.LogWarning("Pipe stream ended (null received). Assuming disconnection.");
-                        break; // Pipe closed or stream ended
+                        _logger.LogWarning("IPC pipe connection closed by server (ReadLineAsync returned null).");
+                        break; 
                     }
 
-                    _logger.LogDebug("Received IPC message: {MessageJson}", messageJson);
-                    await ProcessMessageAsync(messageJson);
+                    _logger.LogTrace("IPC message received: {MessageJson}", messageJson);
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await ProcessMessageAsync(messageJson, cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            _logger.LogInformation("ProcessMessageAsync cancelled.");
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Error processing IPC message in background task.");
+                        }
+                    }, cancellationToken);
                 }
             }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            catch (OperationCanceledException)
             {
-                _logger.LogInformation("IPC listener gracefully stopped due to cancellation request.");
+                _logger.LogInformation("IPC listener task was cancelled.");
             }
-            catch (IOException ex)
+            catch (IOException ioEx)
             {
-                _logger.LogWarning(ex, "IOException in IPC listener (e.g. pipe broken).");
+                _logger.LogWarning(ioEx, "IOException in IPC listener (e.g. pipe broken).");
+            }
+            catch (ObjectDisposedException odEx)
+            {
+                _logger.LogWarning(odEx, "ObjectDisposedException in IPC listener (e.g. pipe closed during read).");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Unhandled exception in IPC listener.");
+                _logger.LogError(ex, "Unhandled exception in IPC listener task.");
             }
             finally
             {
-                _logger.LogInformation("IPC listener task shutting down.");
-                if (_isConnected) // If still marked as connected, initiate disconnect
+                _logger.LogInformation("IPC listener task finishing.");
+                if (_isConnected) 
                 {
-                    await DisconnectAsyncInternal(true); // Signal it's an unexpected disconnect
+                    await DisconnectAsyncInternal().ConfigureAwait(false);
                 }
             }
         }
 
-        private async Task ProcessMessageAsync(string messageJson)
+        private async Task ProcessMessageAsync(string messageJson, CancellationToken cancellationToken)
         {
+            if (cancellationToken.IsCancellationRequested) return;
+
             try
             {
                 var baseMessage = JsonConvert.DeserializeObject<IpcMessage<object>>(messageJson);
                 if (baseMessage == null || string.IsNullOrEmpty(baseMessage.Type))
                 {
-                    _logger.LogWarning("Received an invalid or untyped IPC message: {MessageJson}", messageJson);
+                    _logger.LogWarning("Failed to deserialize base IPC message, message was null, or type was empty.");
                     return;
                 }
 
-                _logger.LogDebug("Processing message of type: {MessageType}", baseMessage.Type);
+                _logger.LogDebug("Processing IPC message of type: {MessageType}", baseMessage.Type);
 
                 switch (baseMessage.Type)
                 {
-                    case "ServiceStatus":
-                        var statusMessage = JsonConvert.DeserializeObject<IpcMessage<PipeServiceStatus>>(messageJson);
-                        if (statusMessage?.Payload != null && ServiceStatusReceived != null)
-                        {
-                            await ServiceStatusReceived.Invoke(statusMessage.Payload);
-                        }
-                        break;
-                    case "LOG_ENTRIES":
+                    case IpcMessageTypes.LogEntry:
+                        // Assuming LogEntry messages carry a list of strings for LogEntriesReceived event
                         var logEntriesMessage = JsonConvert.DeserializeObject<IpcMessage<List<string>>>(messageJson);
                         if (logEntriesMessage?.Payload != null && LogEntriesReceived != null)
                         {
                             _logger.LogDebug("Invoking LogEntriesReceived event with {Count} entries.", logEntriesMessage.Payload.Count);
-                            await LogEntriesReceived.Invoke(logEntriesMessage.Payload);
+                            await LogEntriesReceived.Invoke(logEntriesMessage.Payload).ConfigureAwait(false);
                         }
                         else
                         {
-                            _logger.LogWarning("Received LOG_ENTRIES message but payload was null or no subscribers for LogEntriesReceived event.");
+                            _logger.LogWarning("Received LOG_ENTRY message but payload was null or no subscribers for LogEntriesReceived event.");
                         }
                         break;
-                    // Add other message types here if the service sends more than status
-                    // case "SettingsUpdateRequested": 
-                    //    // Example: if service can request settings from UI
-                    //    break;
+                    case IpcMessageTypes.StatusUpdate:
+                        // Assuming StatusUpdate messages carry a PipeServiceStatus object
+                        var statusMessage = JsonConvert.DeserializeObject<IpcMessage<PipeServiceStatus>>(messageJson);
+                        if (statusMessage?.Payload != null && ServiceStatusReceived != null)
+                        {
+                             _logger.LogDebug("Invoking ServiceStatusReceived event.");
+                            await ServiceStatusReceived.Invoke(statusMessage.Payload).ConfigureAwait(false);
+                        }
+                         else
+                        {
+                            _logger.LogWarning("Received STATUS_UPDATE message but payload was null or no subscribers for ServiceStatusReceived event.");
+                        }
+                        break;
+                    case IpcMessageTypes.StateSnapshot:
+                        var stateSnapshotMessage = JsonConvert.DeserializeObject<IpcMessage<ServiceStateSnapshot>>(messageJson);
+                        if (stateSnapshotMessage?.Payload != null && StateSnapshotReceived != null)
+                        {
+                            _logger.LogDebug("Invoking StateSnapshotReceived event.");
+                            await StateSnapshotReceived.Invoke(stateSnapshotMessage.Payload).ConfigureAwait(false);
+                        }
+                        else
+                        {
+                            _logger.LogWarning("Received STATE_SNAPSHOT message but payload was null or no subscribers for StateSnapshotReceived event.");
+                        }
+                        break;
                     default:
                         _logger.LogWarning("Unknown IPC message type received: {MessageType}", baseMessage.Type);
                         break;
@@ -212,7 +295,7 @@ namespace Log2Postgres.Core.Services
             }
             catch (JsonException jsonEx)
             {
-                _logger.LogError(jsonEx, "JSON deserialization error in ProcessMessageAsync for message: {MessageJson}", messageJson);
+                _logger.LogError(jsonEx, "Error deserializing IPC message: {MessageJson}", messageJson);
             }
             catch (Exception ex)
             {
@@ -220,143 +303,166 @@ namespace Log2Postgres.Core.Services
             }
         }
         
-        public async Task DisconnectAsync()
-        {
-            await DisconnectAsyncInternal(false); // User-initiated disconnect
-        }
-
-        private async Task DisconnectAsyncInternal(bool dueToErrorOrClosure)
-        {
-            if (!_isConnected && _pipeClient == null) // Already disconnected or never connected
-            {
-                _logger.LogInformation("Disconnect called but already disconnected or not initialized.");
-                return;
-            }
-
-            await _pipeLock.WaitAsync(); // Ensure exclusive access for disconnection
-            try
-            {
-                if (!_isConnected && _pipeClient == null) return; // Check again inside lock
-
-                _logger.LogInformation("Disconnecting from service pipe... Error/Closure: {DueToError}", dueToErrorOrClosure);
-
-                if (_listenerCts != null)
-                {
-                    _listenerCts.Cancel();
-                    _listenerCts.Dispose();
-                    _listenerCts = null;
-                }
-
-                if (_listenerTask != null)
-                {
-                    try
-                    {
-                         // Give it a moment to shut down gracefully
-                        bool completed = await Task.WhenAny(_listenerTask, Task.Delay(TimeSpan.FromSeconds(2))) == _listenerTask;
-                        if(!completed) _logger.LogWarning("Listener task did not complete in time during disconnect.");
-                    }
-                    catch (Exception ex) {
-                        _logger.LogWarning(ex, "Exception while waiting for listener task to complete during disconnect.");
-                    }
-                    _listenerTask = null;
-                }
-                
-                await CleanupPipeResourcesAsync();
-
-                _isConnected = false;
-                
-                if (PipeDisconnected != null)
-                {
-                   await PipeDisconnected.Invoke();
-                }
-                _logger.LogInformation("Successfully disconnected from service pipe.");
-
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error during disconnection from service pipe.");
-            }
-            finally
-            {
-                _pipeLock.Release();
-            }
-        }
-        
-        private async Task CleanupPipeResourcesAsync()
-        {
-            // This method should not acquire the _pipeLock itself, as it's called from within locked sections.
-            _logger.LogDebug("Cleaning up pipe resources.");
-            if (_pipeWriter != null)
-            {
-                try { await _pipeWriter.DisposeAsync(); } catch (Exception ex) { _logger.LogTrace(ex, "Exception disposing StreamWriter."); }
-                _pipeWriter = null;
-            }
-            if (_pipeReader != null)
-            {
-                // StreamReader.Dispose typically handles underlying stream, but do it explicitly if _pipeClient isn't null.
-                // No async dispose for StreamReader directly, but its stream might be an issue if not closed.
-                try { _pipeReader.Dispose(); } catch (Exception ex) { _logger.LogTrace(ex, "Exception disposing StreamReader."); }
-                _pipeReader = null;
-            }
-            if (_pipeClient != null)
-            {
-                try { await _pipeClient.DisposeAsync(); } catch (Exception ex) { _logger.LogTrace(ex, "Exception disposing PipeClient."); }
-                _pipeClient = null;
-            }
-        }
-
         public async Task SendCommandAsync<T>(string type, T payload, CancellationToken cancellationToken = default)
         {
             if (!_isConnected || _pipeWriter == null)
             {
-                _logger.LogWarning("Cannot send command '{Type}': Not connected to service pipe.", type);
-                throw new InvalidOperationException("Not connected to the service pipe.");
+                _logger.LogWarning("SendCommandAsync: Not connected or writer is null. Cannot send command type {CommandType}.", type);
+                return;
+            }
+            var message = new IpcMessage<T> { Type = type, Payload = payload };
+            await SendRawMessageAsync(message, cancellationToken).ConfigureAwait(false);
+        }
+
+        private async Task SendRawMessageAsync<T>(IpcMessage<T> message, CancellationToken cancellationToken)
+        {
+            if (!_isConnected || _pipeWriter == null || _pipeClient == null || !_pipeClient.IsConnected)
+            {
+                _logger.LogWarning("SendRawMessageAsync: IPC client not connected, writer is null, or pipe is not connected. Cannot send message type {MessageType}.", message?.Type);
+                return;
             }
 
-            await _pipeLock.WaitAsync(cancellationToken);
             try
             {
-                if (!_isConnected || _pipeWriter == null) // Re-check inside lock
-                {
-                     _logger.LogWarning("Cannot send command '{Type}' (checked in lock): Not connected to service pipe.", type);
-                     throw new InvalidOperationException("Not connected to the service pipe (checked in lock).");
-                }
-
-                var message = new IpcMessage<T> { Type = type, Payload = payload };
-                string messageJson = JsonConvert.SerializeObject(message);
-                _logger.LogDebug("Sending IPC command: {MessageJson}", messageJson);
-                await _pipeWriter.WriteLineAsync(messageJson.AsMemory(), cancellationToken);
-                // AutoFlush is true, so no need to call Flush explicitly.
+                string jsonMessage = JsonConvert.SerializeObject(message);
+                _logger.LogDebug("Attempting to send IPC message: {JsonMessage}", jsonMessage);
+                await _pipeWriter.WriteLineAsync(jsonMessage.AsMemory(), cancellationToken).ConfigureAwait(false);
+                await _pipeWriter.FlushAsync(cancellationToken).ConfigureAwait(false);
+                _logger.LogInformation("Sent IPC message: {JsonMessage}", jsonMessage);
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("SendRawMessageAsync was cancelled during write/flush.");
+            }
+            catch (ObjectDisposedException odEx)
+            {
+                 _logger.LogError(odEx, "Exception during SendRawMessageAsync: Pipe was disposed. Attempting to disconnect.");
+                 await DisconnectAsyncInternal().ConfigureAwait(false); 
+            }
+            catch (IOException ioEx)
+            {
+                _logger.LogError(ioEx, "IOException during SendRawMessageAsync (e.g. pipe broken). Attempting to disconnect.");
+                await DisconnectAsyncInternal().ConfigureAwait(false); 
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error sending IPC command of type '{Type}'.", type);
-                // Consider if this should trigger a disconnect
-                await DisconnectAsyncInternal(true); // Assume pipe is broken
-                throw; // Re-throw
-            }
-            finally
-            {
-                _pipeLock.Release();
+                _logger.LogError(ex, "Exception during SendRawMessageAsync while writing/flushing to pipe.");
+                throw;
             }
         }
 
+
+        private async Task DisconnectAsyncInternal()
+        {
+            if (!_isConnected && _pipeClient == null) 
+            {
+                _logger.LogDebug("DisconnectAsyncInternal called but already disconnected or never connected.");
+                return;
+            }
+
+            _logger.LogInformation("DisconnectAsyncInternal: Initiating disconnection from IPC pipe.");
+            _isConnected = false; 
+
+            if (_receiveCts != null)
+            {
+                _logger.LogDebug("Cancelling receive task CTS.");
+                _receiveCts.Cancel();
+                _receiveCts.Dispose();
+                _receiveCts = null;
+            }
+
+            if (_receiveTask != null)
+            {
+                _logger.LogDebug("Waiting for receive task to complete...");
+                try
+                {
+                    await Task.WhenAny(_receiveTask, Task.Delay(TimeSpan.FromSeconds(2))).ConfigureAwait(false); 
+                    if (!_receiveTask.IsCompleted)
+                    {
+                        _logger.LogWarning("Receive task did not complete in time.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Exception while waiting for receive task to complete during disconnect.");
+                }
+                _receiveTask = null;
+            }
+            
+            lock (_lock) 
+            {
+                if (_pipeWriter != null)
+                {
+                    _logger.LogDebug("Disposing StreamWriter.");
+                    try { _pipeWriter.Dispose(); } catch (Exception ex) { _logger.LogWarning(ex, "Exception disposing StreamWriter."); }
+                    _pipeWriter = null;
+                }
+
+                if (_pipeReader != null)
+                {
+                    _logger.LogDebug("Disposing StreamReader.");
+                    try { _pipeReader.Dispose(); } catch (Exception ex) { _logger.LogWarning(ex, "Exception disposing StreamReader."); }
+                    _pipeReader = null;
+                }
+
+                if (_pipeClient != null)
+                {
+                    _logger.LogDebug("Closing and disposing NamedPipeClientStream.");
+                    try
+                    {
+                        _pipeClient.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Exception closing/disposing NamedPipeClientStream.");
+                    }
+                    _pipeClient = null;
+                }
+            }
+
+            _logger.LogInformation("IPC client disconnected.");
+            try
+            {
+                if (PipeDisconnected != null) // Check for null before invoking
+                {
+                    await PipeDisconnected.Invoke().ConfigureAwait(false);
+                }
+            }
+            catch(Exception ex)
+            {
+                _logger.LogWarning(ex, "Exception during Disconnected event invocation.");
+            }
+        }
+
+        public async Task DisconnectAsync()
+        {
+            await DisconnectAsyncInternal().ConfigureAwait(false);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _logger.LogInformation("IpcService DisposeAsync called.");
+            await DisconnectAsyncInternal().ConfigureAwait(false);
+            GC.SuppressFinalize(this);
+        }
+        
         public async Task SendServiceStatusRequestAsync(CancellationToken cancellationToken = default)
         {
-            await SendCommandAsync<object?>("RequestStatus", null, cancellationToken);
+            await SendCommandAsync(IpcMessageTypes.RequestState, "REQUEST_STATUS", cancellationToken).ConfigureAwait(false);
         }
 
         public async Task SendSettingsAsync(LogMonitorSettings settings, CancellationToken cancellationToken = default)
         {
-            await SendCommandAsync("UpdateSettings", settings, cancellationToken);
+            await SendCommandAsync(IpcMessageTypes.Command, new { CommandType = "UpdateSettings", settings }, cancellationToken).ConfigureAwait(false);
         }
-        
-        public async ValueTask DisposeAsync()
-        {
-            _logger.LogInformation("Disposing IpcService...");
-            await DisconnectAsyncInternal(false); // Ensure cleanup on dispose
-            _pipeLock.Dispose();
-            GC.SuppressFinalize(this);
-        }
+    }
+
+    public static class IpcMessageTypes
+    {
+        public const string LogEntry = "LOG_ENTRY"; // Handled to expect IpcMessage<List<string>>
+        public const string StatusUpdate = "STATUS_UPDATE"; // Handled to expect IpcMessage<PipeServiceStatus>
+        public const string Command = "COMMAND"; // Generic command
+        public const string StateSnapshot = "STATE_SNAPSHOT"; // Handled to expect IpcMessage<ServiceStateSnapshot>
+        public const string RequestState = "REQUEST_STATE";   // UI to request state from service
     }
 } 

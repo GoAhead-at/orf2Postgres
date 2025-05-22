@@ -88,6 +88,7 @@ public partial class MainWindow : Window, IAsyncDisposable
     private bool _hasUnsavedChanges = false;
     private System.Threading.Timer? _positionUpdateTimer;
     private DispatcherTimer? _serviceStatusTimer; // Restored declaration
+    private bool _isServiceInstalledCached = false; // Added to cache service installation state
 
 #pragma warning disable CS8618
     public string ServiceOperationalState { get; set; } = string.Empty;
@@ -230,7 +231,15 @@ public partial class MainWindow : Window, IAsyncDisposable
     {
         try
         {
-            if (!_ipcService.IsConnected)
+            bool allowIpcConnectionAttempt = true;
+            if (!_isServiceInstalledCached && (_logFileWatcher == null || !_logFileWatcher.IsProcessing))
+            {
+                // If in UI-managed mode AND local processing is not active, don't try to connect IPC.
+                allowIpcConnectionAttempt = false;
+                _logger.LogTrace("ServiceStatusTimer: UI-managed mode and local processing not active. Skipping IPC connection attempt.");
+            }
+
+            if (allowIpcConnectionAttempt && !_ipcService.IsConnected)
             {
                 _logger.LogDebug("ServiceStatusTimer: IPC not connected, attempting to connect.");
                 try
@@ -244,9 +253,10 @@ public partial class MainWindow : Window, IAsyncDisposable
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "ServiceStatusTimer: Failed to connect to IPC service.");
+                    // UI will be updated by UpdateServiceControlUi below
                 }
             }
-            else
+            else if (_ipcService.IsConnected) // Only send status request if already connected
             {
                 await _ipcService.SendServiceStatusRequestAsync();
             }
@@ -255,7 +265,7 @@ public partial class MainWindow : Window, IAsyncDisposable
         {
             _logger.LogError(ex, "Error in ServiceStatusTimer_Tick.");
         }
-        UpdateServiceControlUi();
+        UpdateServiceControlUi(); // Always update UI based on current states
     }
 
     private async void MainWindow_Closing(object? sender, CancelEventArgs e)
@@ -1249,61 +1259,114 @@ public partial class MainWindow : Window, IAsyncDisposable
         // No need to call UpdateDbActionButtonsState here as password doesn't gate button enablement
     }
 
-    private void UpdateUiWithServiceStatus(PipeServiceStatus? pipeStatus, bool serviceAvailable, ServiceControllerStatus scStatus, bool isInstalled)
+    private void UpdateUiWithServiceStatus(PipeServiceStatus? pipeStatus, bool serviceAvailableViaIpc, ServiceControllerStatus scStatus, bool isInstalled)
     {
-        if (pipeStatus != null) // IPC is connected and sent status
+        _isServiceInstalledCached = isInstalled; // Cache the installation status
+        // bool isAdmin = App.IsAdministrator(); // No longer directly needed for Start/Stop Service button enablement if they elevate
+
+        if (isInstalled)
         {
-            CurrentFileText.Text = pipeStatus.CurrentFile ?? "N/A";
-            CurrentPositionText.Text = pipeStatus.CurrentPosition.ToString();
-            LinesProcessedText.Text = pipeStatus.TotalLinesProcessedSinceStart.ToString();
-            LastErrorText.Text = pipeStatus.LastErrorMessage ?? "None";
-            ProcessingStatusText.Text = pipeStatus.IsProcessing ? "Processing" : "Idle";
+            // SERVICE MODE
+            if (InstallBtn != null)
+            {
+                InstallBtn.Content = "Install Service"; 
+                InstallBtn.IsEnabled = false;
+                InstallBtn.ToolTip = "Service is already installed.";
+            }
+            if (UninstallBtn != null)
+            {
+                UninstallBtn.Content = "Uninstall Service"; 
+                UninstallBtn.IsEnabled = true; // Enabled, App.UninstallService handles UAC
+                UninstallBtn.ToolTip = "Uninstall the Windows service (will request Administrator privileges).";
+            }
+
+            if (StartBtn != null)
+            {
+                StartBtn.Content = "Start Service";
+                StartBtn.ToolTip = "Start the Windows service (will request Administrator privileges).";
+                // Enable if service is stoppable/startable, assuming App.StartWindowsService handles UAC
+                StartBtn.IsEnabled = (scStatus == ServiceControllerStatus.Stopped || scStatus == ServiceControllerStatus.StopPending);
+            }
+            if (StopBtn != null)
+            {
+                StopBtn.Content = "Stop Service";
+                StopBtn.ToolTip = "Stop the Windows service (will request Administrator privileges).";
+                // Enable if service is running/stoppable, assuming App.StopWindowsService handles UAC
+                StopBtn.IsEnabled = (scStatus == ServiceControllerStatus.Running || scStatus == ServiceControllerStatus.StartPending || scStatus == ServiceControllerStatus.PausePending || scStatus == ServiceControllerStatus.ContinuePending);
+            }
+
+            if (PipeStatusTextBlock != null)
+                 PipeStatusTextBlock.Text = pipeStatus?.ServiceOperationalState ?? (serviceAvailableViaIpc ? "Connected, awaiting status..." : "Service Not Responding");
             
-            PipeStatusIndicator.Background = System.Windows.Media.Brushes.Green;
-            PipeStatusTextBlock.Text = "Connected (Processing)"; 
+            if (ProcessingStatusText != null)
+                ProcessingStatusText.Text = pipeStatus?.IsProcessing ?? false ? "Service: Processing Active" : "Service: Processing Inactive";
+
+            if (serviceAvailableViaIpc && pipeStatus != null)
+            {
+                if (CurrentFileText != null) CurrentFileText.Text = pipeStatus.CurrentFile;
+                if (CurrentPositionText != null) CurrentPositionText.Text = pipeStatus.CurrentPosition.ToString();
+                if (LinesProcessedText != null) LinesProcessedText.Text = pipeStatus.TotalLinesProcessedSinceStart.ToString();
+                if (PipeStatusIndicator != null) PipeStatusIndicator.Background = new SolidColorBrush(Colors.Green);
+            }
+            else
+            {
+                if (CurrentFileText != null) CurrentFileText.Text = "N/A";
+                if (CurrentPositionText != null) CurrentPositionText.Text = "N/A";
+                if (LinesProcessedText != null) LinesProcessedText.Text = "N/A";
+                if (PipeStatusIndicator != null) PipeStatusIndicator.Background = new SolidColorBrush(Colors.Orange);
+                if (PipeStatusTextBlock != null && string.IsNullOrEmpty(pipeStatus?.ServiceOperationalState))
+                {
+                     PipeStatusTextBlock.Text = $"Service: {scStatus.ToString()}"; 
+                }
+            }
         }
-        else // IPC not connected or no status received via IPC
+        else // Service NOT installed - LOCAL PROCESSING MODE
         {
-            // Clear pipe-dependent fields or set to defaults for non-connected state
-            CurrentFileText.Text = "N/A";
-            CurrentPositionText.Text = "N/A"; // Or could show last known if desired and stored
-            LinesProcessedText.Text = "N/A";
-            // LastErrorText might be preserved or cleared depending on desired behavior
-            ProcessingStatusText.Text = isInstalled ? scStatus.ToString() : "Not Installed"; 
+            if (InstallBtn != null)
+            {
+                InstallBtn.Content = "Install Service"; 
+                InstallBtn.IsEnabled = !_isProcessing; // Enabled if local processing is NOT active, App.InstallService handles UAC
+                InstallBtn.ToolTip = _isProcessing ? "Cannot install service while local processing is active." : "Install the Windows service (will request Administrator privileges).";
+            }
+            if (UninstallBtn != null)
+            {
+                UninstallBtn.Content = "Uninstall Service"; 
+                UninstallBtn.IsEnabled = false;
+                UninstallBtn.ToolTip = "Service is not installed.";
+            }
 
-            if (_ipcService.IsConnected) // Should ideally not happen if pipeStatus is null, but as a safeguard
+            if (StartBtn != null)
             {
-                 PipeStatusIndicator.Background = System.Windows.Media.Brushes.Green; // Connected but no status data?
-                 PipeStatusTextBlock.Text = "Connected (Idle)";
+                StartBtn.Content = "Start Local Processing";
+                StartBtn.ToolTip = "Start log processing within this application window.";
+                StartBtn.IsEnabled = !_isProcessing; 
             }
-            else // IPC is definitely not connected
+            if (StopBtn != null)
             {
-                PipeStatusIndicator.Background = System.Windows.Media.Brushes.Gray;
-                if (!isInstalled)
-                {
-                    PipeStatusTextBlock.Text = "Not Installed";
-                }
-                else
-                {
-                    // Service is installed but IPC not connected, show SC status
-                    PipeStatusTextBlock.Text = scStatus.ToString(); 
-                }
+                StopBtn.Content = "Stop Local Processing";
+                StopBtn.ToolTip = "Stop log processing within this application window.";
+                StopBtn.IsEnabled = _isProcessing; 
             }
+
+            if (PipeStatusTextBlock != null) PipeStatusTextBlock.Text = "Local Mode";
+            if (ProcessingStatusText != null) 
+                ProcessingStatusText.Text = _isProcessing ? "Local: Active" : "Local: Inactive";
+            
+            if (_isProcessing && _logFileWatcher != null)
+            {
+                if (CurrentFileText != null) CurrentFileText.Text = _logFileWatcher.CurrentFile;
+                if (CurrentPositionText != null) CurrentPositionText.Text = _logFileWatcher.CurrentPosition.ToString();
+                if (LinesProcessedText != null) LinesProcessedText.Text = _logFileWatcher.TotalLinesProcessed.ToString();
+            }
+            else
+            {
+                if (CurrentFileText != null) CurrentFileText.Text = "N/A";
+                if (CurrentPositionText != null) CurrentPositionText.Text = "N/A";
+                if (LinesProcessedText != null) LinesProcessedText.Text = "N/A";
+            }
+            if (PipeStatusIndicator != null) PipeStatusIndicator.Background = new SolidColorBrush(Colors.Blue); 
         }
-        
-        StartBtn.IsEnabled = isInstalled && scStatus != ServiceControllerStatus.Running && scStatus != ServiceControllerStatus.StartPending;
-        StopBtn.IsEnabled = isInstalled && (scStatus == ServiceControllerStatus.Running || scStatus == ServiceControllerStatus.StartPending);
-        InstallBtn.IsEnabled = !isInstalled; 
-        UninstallBtn.IsEnabled = isInstalled; 
-        
-        // Redundant background/text set for PipeStatusIndicator/TextBlock based on _ipcService.IsConnected already handled above.
-        // If pipeStatus is null, the 'else' block above sets these.
-        // If pipeStatus is not null, the 'if (pipeStatus != null)' block sets these.
-        // This simplified line can be removed or kept if it clarifies the default disconnected visual when no pipe status comes through.
-        // PipeStatusIndicator.Background = _ipcService.IsConnected ? System.Windows.Media.Brushes.Green : System.Windows.Media.Brushes.Red; 
-        // PipeStatusTextBlock.Text = _ipcService.IsConnected ? "Connected" : "Disconnected";
-
-        UpdateDbActionButtonsState();
+        UpdateDbActionButtonsState(); 
     }
 
     private void UpdateServiceControlUi()
@@ -1313,13 +1376,13 @@ public partial class MainWindow : Window, IAsyncDisposable
 
         try
         {
-            using (var sc = new ServiceController(App.WindowsServiceName)) // Use constant
+            using (var sc = new ServiceController(App.WindowsServiceName)) 
             {
                 isServiceInstalled = true;
                 currentScStatus = sc.Status;
             }
         }
-        catch (InvalidOperationException) // Service not installed
+        catch (InvalidOperationException) 
         {
             isServiceInstalled = false;
             currentScStatus = ServiceControllerStatus.Stopped; 
@@ -1327,17 +1390,16 @@ public partial class MainWindow : Window, IAsyncDisposable
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error getting service controller status.");
-            isServiceInstalled = false; // Assume not installed or error state
+            isServiceInstalled = false; 
             currentScStatus = ServiceControllerStatus.Stopped;
         }
 
+        // UpdateUiWithServiceStatus now handles all relevant button states and tooltips.
         UpdateUiWithServiceStatus(null, _ipcService.IsConnected, currentScStatus, isServiceInstalled);
         
-        bool isAdmin = App.IsAdministrator();
-        if (InstallBtn != null) InstallBtn.ToolTip = isAdmin ? "Install the Windows service." : "Requires Administrator privileges.";
-        if (UninstallBtn != null) UninstallBtn.ToolTip = isAdmin ? "Uninstall the Windows service." : "Requires Administrator privileges.";
-        if (StartBtn != null) StartBtn.ToolTip = isAdmin ? "Start the Windows service." : "Requires Administrator privileges.";
-        if (StopBtn != null) StopBtn.ToolTip = isAdmin ? "Stop the Windows service." : "Requires Administrator privileges.";
+        // The generic tooltip updates for InstallBtn, UninstallBtn, StartBtn, StopBtn
+        // that were previously here are now removed, as UpdateUiWithServiceStatus
+        // handles mode-specific tooltips more accurately.
     }
 
     private async void TestConnectionBtn_Click(object sender, RoutedEventArgs e)
@@ -1385,64 +1447,121 @@ public partial class MainWindow : Window, IAsyncDisposable
 
     private async void StartBtn_Click(object sender, RoutedEventArgs e)
     {
-        _logger.LogInformation("Start Service button clicked. Attempting to call App.StartWindowsService().");
-        // The App.IsAdministrator() check is removed. App.StartWindowsService will handle elevation.
-
-        if (_isProcessing) // _isProcessing refers to local UI-managed processing
+        if (_isServiceInstalledCached) // Check cached service installation state
         {
-            var choice = System.Windows.MessageBox.Show(
-                "Local UI-managed processing is currently active. It is recommended to stop it before starting the Windows service to avoid conflicts. Stop local processing now?",
-                "Local Processing Active",
-                MessageBoxButton.YesNoCancel,
-                MessageBoxImage.Warning);
+            _logger.LogInformation("Start Service button clicked (service is installed). Attempting to call App.StartWindowsService().");
 
-            if (choice == MessageBoxResult.Yes)
+            if (_isProcessing) // _isProcessing here refers to local UI-managed processing
             {
-                StopProcessing(); // This stops local UI processing
-                _logger.LogInformation("Local UI processing stopped by user before starting service.");
-                await Task.Delay(200); // Give a moment for UI to update and processing to cease.
+                var choice = System.Windows.MessageBox.Show(
+                    "Local UI-managed processing is currently active. It is recommended to stop it before starting the Windows service to avoid conflicts. Stop local processing now?",
+                    "Local Processing Active",
+                    MessageBoxButton.YesNoCancel,
+                    MessageBoxImage.Warning);
+
+                if (choice == MessageBoxResult.Yes)
+                {
+                    StopProcessing(); // This stops local UI processing
+                    _logger.LogInformation("Local UI processing stopped by user before starting service.");
+                    await Task.Delay(200); // Give a moment for UI to update and processing to cease.
+                }
+                else if (choice == MessageBoxResult.Cancel)
+                {
+                    _logger.LogInformation("Service start cancelled by user due to active local processing.");
+                    UpdateServiceControlUi(); // Refresh UI
+                    return;
+                }
             }
-            else if (choice == MessageBoxResult.Cancel)
+
+            App.StartWindowsService(App.WindowsServiceName); // Use constant
+            
+            if (_ipcService != null && !_ipcService.IsConnected)
             {
-                _logger.LogInformation("Service start cancelled by user due to active local processing.");
-                UpdateServiceControlUi();
-                return;
+                _logger.LogInformation("Attempting to connect IPC after starting Windows service (with delay).");
+                await Task.Delay(1500); // Increased delay for service to start up its pipe server
+                try
+                {
+                    await _ipcService.ConnectAsync(); 
+                    if(_ipcService.IsConnected)
+                    {
+                         await _ipcService.SendServiceStatusRequestAsync();
+                    }
+                }
+                catch(Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to connect IPC after starting Windows service.");
+                }
             }
-            // If 'No', user chose to proceed despite the warning.
         }
-
-        App.StartWindowsService(App.WindowsServiceName); // Use constant
-        UpdateServiceControlUi(); // Refresh UI after attempting action
-        
-        if (_ipcService != null && !_ipcService.IsConnected)
+        else // Service is NOT installed, so this button means "Start Local Processing"
         {
-            await Task.Delay(1000); // Brief delay to allow service to potentially start up
-            await _ipcService.ConnectAsync(); // Attempt to connect IPC
+            _logger.LogInformation("Start Local Processing button clicked.");
+            if (!_isProcessing)
+            {
+                await StartProcessingAsync(); // This method now ensures LogFileWatcher's IPC is ready if it starts successfully
+                
+                // After StartProcessingAsync, check if it was successful and if IPC can be connected
+                if (_logFileWatcher != null && _logFileWatcher.IsProcessing && _ipcService != null && !_ipcService.IsConnected)
+                {
+                    _logger.LogInformation("Local processing started. Attempting to connect IPC.");
+                    try
+                    {
+                        await _ipcService.ConnectAsync();
+                        if(_ipcService.IsConnected)
+                        {
+                            await _ipcService.SendServiceStatusRequestAsync();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to connect IPC after starting local processing.");
+                    }
+                }
+                else if (_logFileWatcher != null && !_logFileWatcher.IsProcessing)
+                {
+                    _logger.LogWarning("Local processing failed to start or was stopped. IPC connection not attempted.");
+                }
+            }
+            else
+            {
+                _logger.LogWarning("Start Local Processing button clicked, but local processing is already active.");
+            }
         }
-        if (_ipcService != null && _ipcService.IsConnected)
-        {
-            await _ipcService.SendServiceStatusRequestAsync();
-        }
-
-        UpdateServiceControlUi(); // Refresh UI after attempting action
+        UpdateServiceControlUi(); // Ensure UI is refreshed after any action or state change
     }
 
     private async void StopBtn_Click(object sender, RoutedEventArgs e)
     {
-        _logger.LogInformation("Stop Service button clicked. Attempting to call App.StopWindowsService().");
-        // The App.IsAdministrator() check is removed. App.StopWindowsService will handle elevation.
-        
-        App.StopWindowsService(App.WindowsServiceName); // Use constant
-        UpdateServiceControlUi(); // Refresh UI after attempting action
-        // Consider awaiting IPC disconnection if StopWindowsService doesn't block.
-        if (_ipcService != null && _ipcService.IsConnected)
+        if (_isServiceInstalledCached) // Check cached service installation state
         {
-            // Service stop might take a moment, IPC might disconnect itself via its own logic.
-            // Forcing a status request might not be reliable immediately.
-            // UI update relies on UpdateServiceControlUi and IPC disconnection events.
-            await Task.Delay(500); // Give a moment for UI to update from SC and IPC events
-            UpdateServiceControlUi();
+            _logger.LogInformation("Stop Service button clicked (service is installed). Attempting to call App.StopWindowsService().");
+            // The App.IsAdministrator() check is removed. App.StopWindowsService will handle elevation.
+            
+            App.StopWindowsService(App.WindowsServiceName); // Use constant
+            //UpdateServiceControlUi(); // Refresh UI after attempting action // Potentially too soon
+
+            if (_ipcService != null && _ipcService.IsConnected)
+            {
+                // Service stop might take a moment, IPC might disconnect itself via its own logic.
+                // Forcing a status request might not be reliable immediately.
+                // UI update relies on UpdateServiceControlUi and IPC disconnection events.
+                await Task.Delay(500); // Give a moment for UI to update from SC and IPC events
+            }
         }
+        else // Service is NOT installed, so this button means "Stop Local Processing"
+        {
+            _logger.LogInformation("Stop Local Processing button clicked.");
+            if (_isProcessing)
+            {
+                StopProcessing(); // This method handles UI updates internally
+            }
+            else
+            {
+                _logger.LogWarning("Stop Local Processing button clicked, but local processing is not active.");
+            }
+            // UpdateServiceControlUi(); // StopProcessing should trigger necessary UI updates
+        }
+        UpdateServiceControlUi(); // Ensure UI is refreshed after any action or state change
     }
 
     private void SaveConfigBtn_Click(object sender, RoutedEventArgs e)

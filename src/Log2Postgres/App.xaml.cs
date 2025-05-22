@@ -333,62 +333,110 @@ namespace Log2Postgres
 
         protected override async void OnStartup(StartupEventArgs e)
         {
-            base.OnStartup(e);
-            Console.WriteLine("[App.OnStartup] Application starting.");
-            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup ENTERED.\n");
-
-            bool createdNew;
-            _singleInstanceMutex = new Mutex(true, MutexName, out createdNew);
-
-            if (!createdNew)
+            string onStartupLog = Path.Combine(AppContext.BaseDirectory, "OnStartup_Log.txt");
+            try
             {
-                // Another instance is already running.
-                Console.WriteLine("[App.OnStartup] Another instance detected. Activating it and shutting down current instance.");
-                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: Another instance detected. Activating and exiting.\n");
-                ActivateExistingInstance();
-                Shutdown();
-                return;
-            }
+                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] OnStartup ENTERED. Args: {string.Join(", ", e.Args)}\n");
 
-            // Proceed with starting the host and showing the main window for the new instance.
-            if (_host == null)
-            {
-                Console.WriteLine("[App.OnStartup] _host is null, attempting to build it.");
-                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: _host is null, building.\n");
-                _host = CreateHostBuilder(Environment.GetCommandLineArgs()).Build(); 
-            }
-            
-            Console.WriteLine("[App.OnStartup] Calling _host.StartAsync().");
-            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: Calling _host.StartAsync().\n");
-            await _host.StartAsync(); // Await the host start
-            Console.WriteLine("[App.OnStartup] _host.StartAsync() completed.");
-            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: _host.StartAsync() completed.\n");
+                bool isServiceMode = IsRunningAsService();
+                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] IsRunningAsService evaluated to: {isServiceMode}\n");
 
-            if (!IsRunningAsService()) // Only show UI if not running as a service
-            {
-                var mainWindow = _host.Services.GetService<MainWindow>();
-                if (mainWindow != null) 
+                if (!isServiceMode)
                 {
-                    this.MainWindow = mainWindow; // Assign to App.MainWindow
-                    mainWindow.Show();
-                    Console.WriteLine("[App.OnStartup] MainWindow shown.");
-                    File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: MainWindow shown.\n");
+                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Not service mode. Attempting to acquire Mutex: {MutexName}\n");
+                    _singleInstanceMutex = new Mutex(true, MutexName, out bool createdNew);
+                    if (!createdNew)
+                    {
+                        File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Mutex not created (already exists). Activating existing instance and shutting down.\n");
+                        ActivateExistingInstance();
+                        Shutdown();
+                        return;
+                    }
+                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Mutex acquired.\n");
                 }
                 else
                 {
-                    Console.Error.WriteLine("[App.OnStartup] CRITICAL: MainWindow could not be resolved from services. UI will not show.");
-                    File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: CRITICAL - MainWindow is null.\n");
-                    // Optionally, shutdown or show a message box
-                    System.Windows.MessageBox.Show("Critical error: Main window could not be created. Application will exit.", "Startup Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    Shutdown(1);
+                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Service mode. Skipping Mutex logic.\n");
+                }
+
+                base.OnStartup(e);
+                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] base.OnStartup(e) completed.\n");
+
+                if (_host == null)
+                {
+                     File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Host is null. Building it now.\n");
+                    _host = CreateHostBuilder(e.Args).Build();
+                }
+                
+                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Attempting to start host.\n");
+                await _host.StartAsync();
+                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Host started successfully.\n");
+
+                // Initialize PositionManager
+                var positionManager = _host.Services.GetService<PositionManager>();
+                if (positionManager != null)
+                {
+                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] PositionManager resolved. Attempting to initialize.\n");
+                    try
+                    {
+                        await positionManager.InitializeAsync();
+                        File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] PositionManager initialized successfully.\n");
+                    }
+                    catch (Exception exInitialize)
+                    {
+                        File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] ERROR initializing PositionManager: {exInitialize}\n");
+                        // Decide how to handle this critical failure.
+                        // For now, log and continue, but this might leave the app in a bad state.
+                        System.Windows.MessageBox.Show($"Critical error initializing PositionManager: {exInitialize.Message}. Application might not work correctly.", 
+                                        "Initialization Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    }
+                }
+                else
+                {
+                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] PositionManager could not be resolved from services.\n");
+                     System.Windows.MessageBox.Show("Critical error: PositionManager service not found. Application cannot start.", 
+                                    "Initialization Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                    Shutdown(-1); // Exit if PositionManager is essential and not found
+                    return;
+                }
+
+                if (!isServiceMode)
+                {
+                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Not service mode. Creating and showing MainWindow.\n");
+                    var mainWindow = _host.Services.GetService<MainWindow>();
+                    if (mainWindow != null)
+                    {
+                        Current.MainWindow = mainWindow; // Set the main window
+                        mainWindow.Show();
+                        File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] MainWindow shown.\n");
+                    }
+                    else
+                    {
+                        File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] MainWindow could not be resolved. Shutting down.\n");
+                        System.Windows.MessageBox.Show("Critical error: MainWindow could not be resolved. Application cannot start.", 
+                                        "Startup Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                        Shutdown(-1);
+                        return;
+                    }
+                }
+                else
+                {
+                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Service mode. MainWindow not shown. Application running as service.\n");
+                    // In service mode, the host runs, but no UI is shown.
+                    // The LogFileWatcher (BackgroundService) will be started by the host.
+                }
+                 File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] OnStartup COMPLETED.\n");
+            }
+            catch (Exception ex)
+            {
+                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] CRITICAL ERROR in OnStartup: {ex}\n");
+                System.Windows.MessageBox.Show($"A critical error occurred during application startup: {ex.Message}", "Startup Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                // Ensure shutdown if error is catastrophic
+                if (Current != null && Current.MainWindow == null) // If main window never showed
+                {
+                    Shutdown(-1);
                 }
             }
-            else
-            {
-                Console.WriteLine("[App.OnStartup] Running as a service. UI (MainWindow) will not be shown.");
-                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup: Running as service, UI not shown.\n");
-            }
-            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnStartup EXITED NORMALLY.\n");
         }
 
         private static bool IsRunningAsService()
