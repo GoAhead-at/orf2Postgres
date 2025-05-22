@@ -510,6 +510,7 @@ namespace Log2Postgres.Core.Services
                             await _positionManager.UpdatePositionAsync(filePath, newPosition, cancellationToken);
                             cancellationToken.ThrowIfCancellationRequested();
                             _logger.LogInformation("Processed and saved {Count} entries from {FilePath}", entries.Count, filePath);
+                            await SendCurrentStatusToIpcClientAsync(cancellationToken).ConfigureAwait(false);
                         }
                         else if (savedEntries > 0)
                         {
@@ -549,6 +550,7 @@ namespace Log2Postgres.Core.Services
                 // Release the processing lock using Interlocked for thread safety
                 Interlocked.Exchange(ref _isProcessingFile, 0);
                 _logger.LogDebug("Released processing lock for {FilePath}", filePath);
+                await SendCurrentStatusToIpcClientAsync(CancellationToken.None).ConfigureAwait(false);
             }
         }
         
@@ -791,9 +793,9 @@ namespace Log2Postgres.Core.Services
 
                 switch (baseMessage.Type)
                 {
-                    case "RequestStatus":
-                        _logger.LogDebug("IPC Server: Handling 'RequestStatus' command.");
-                        var statusPayload = new ServiceStatus // Using the internal ServiceStatus class for payload
+                    case IpcMessageTypes.RequestState:
+                        _logger.LogDebug("IPC Server: Handling '{RequestStateType}' command.", IpcMessageTypes.RequestState);
+                        var statusPayload = new PipeServiceStatus
                         {
                             ServiceOperationalState = GetOperationalStateString(),
                             IsProcessing = this.IsProcessing,
@@ -802,16 +804,16 @@ namespace Log2Postgres.Core.Services
                             TotalLinesProcessedSinceStart = this.TotalLinesProcessed,
                             LastErrorMessage = _lastProcessingError ?? string.Empty
                         };
-                        var responseMessage = new IpcMessage<ServiceStatus> { Type = "ServiceStatus", Payload = statusPayload };
+                        var responseMessage = new IpcMessage<PipeServiceStatus> { Type = IpcMessageTypes.StatusUpdate, Payload = statusPayload };
                         string jsonResponse = JsonConvert.SerializeObject(responseMessage);
                          if (_ipcClientStreamWriter != null)
                         {
-                            await _ipcClientStreamWriter.WriteLineAsync(jsonResponse.AsMemory(), cancellationToken);
-                            _logger.LogInformation("IPC Server: Sent 'ServiceStatus' response to client: {JsonResponse}", jsonResponse);
+                            await _ipcClientStreamWriter.WriteLineAsync(jsonResponse.AsMemory(), cancellationToken).ConfigureAwait(false);
+                            _logger.LogInformation("IPC Server: Sent '{StatusUpdateType}' response to client: {JsonResponse}", IpcMessageTypes.StatusUpdate, jsonResponse);
                         }
                         else
                         {
-                            _logger.LogWarning("IPC Server: _ipcClientStreamWriter is null, cannot send 'ServiceStatus' response.");
+                            _logger.LogWarning("IPC Server: _ipcClientStreamWriter is null, cannot send '{StatusUpdateType}' response.", IpcMessageTypes.StatusUpdate);
                         }
                         break;
 
@@ -880,6 +882,48 @@ namespace Log2Postgres.Core.Services
             catch (Exception ex)
             {
                 _logger.LogError(ex, "IPC Server: Error processing IPC message: {MessageJson}", messageJson);
+            }
+        }
+
+        private async Task SendCurrentStatusToIpcClientAsync(CancellationToken cancellationToken = default)
+        {
+            if (_ipcClientStreamWriter == null)
+            {
+                _logger.LogTrace("SendCurrentStatusToIpcClientAsync: No IPC client connected, cannot send status.");
+                return;
+            }
+
+            // Use the shared PipeServiceStatus model from Log2Postgres.Core.Services
+            var statusPayload = new PipeServiceStatus
+            {
+                ServiceOperationalState = GetOperationalStateString(),
+                IsProcessing = this.IsProcessing,
+                CurrentFile = this.CurrentFile,
+                CurrentPosition = this.CurrentPosition,
+                TotalLinesProcessedSinceStart = this.TotalLinesProcessed,
+                LastErrorMessage = _lastProcessingError ?? string.Empty
+            };
+
+            var message = new IpcMessage<PipeServiceStatus> { Type = IpcMessageTypes.StatusUpdate, Payload = statusPayload };
+            string jsonMessage = JsonConvert.SerializeObject(message);
+
+            try
+            {
+                _logger.LogDebug("IPC Server: Proactively sending '{StatusUpdateType}' to client: {JsonMessage}", IpcMessageTypes.StatusUpdate, jsonMessage);
+                await _ipcClientStreamWriter.WriteLineAsync(jsonMessage.AsMemory(), cancellationToken).ConfigureAwait(false);
+            }
+            catch (IOException ioEx)
+            {
+                _logger.LogWarning(ioEx, "IPC Server: IOException proactively sending status update. Client may have disconnected.");
+                // Consider nulling out _ipcClientStreamWriter or other cleanup if pipe is broken.
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("IPC Server: Proactive status update send was cancelled.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "IPC Server: Error proactively sending status update.");
             }
         }
 
@@ -1041,17 +1085,6 @@ namespace Log2Postgres.Core.Services
             public T? Payload { get; set; }
         }
 
-        // Definition for ServiceStatus, needs to match what client (MainWindow) expects or be a shared model
-        private class ServiceStatus
-        {
-            public string ServiceOperationalState { get; set; } = string.Empty;
-            public bool IsProcessing { get; set; }
-            public string CurrentFile { get; set; } = string.Empty;
-            public long CurrentPosition { get; set; }
-            public long TotalLinesProcessedSinceStart { get; set; }
-            public string LastErrorMessage { get; set; } = string.Empty;
-        }
-
         public override async Task StopAsync(CancellationToken cancellationToken)
         {
             _logger.LogInformation("LogFileWatcher Service StopAsync CALLED. Current time: {Time}", DateTime.UtcNow);
@@ -1059,6 +1092,10 @@ namespace Log2Postgres.Core.Services
             _logger.LogInformation("StopAsync: Cancelling _applicationStopping (internal _stoppingCts). Current time: {Time}", DateTime.UtcNow);
             if (!_stoppingCts.IsCancellationRequested) _stoppingCts.Cancel(); // Ensure cancel only once
             _logger.LogInformation("StopAsync: _applicationStopping cancellation requested. IsCancellationRequested: {IsCancelled}. Current time: {Time}", _stoppingCts.IsCancellationRequested, DateTime.UtcNow);
+
+            // Set IsProcessing to false before sending final status
+            IsProcessing = false; 
+            await SendCurrentStatusToIpcClientAsync(CancellationToken.None).ConfigureAwait(false);
 
             // Stop the IPC Server
             if (_ipcServerTask != null && !_ipcServerTask.IsCompleted)
@@ -1207,37 +1244,55 @@ namespace Log2Postgres.Core.Services
         /// <returns>Task representing the operation</returns>
         private async Task StartProcessingAsyncInternal()
         {
-            _logger.LogInformation("StartProcessingAsyncInternal ENTERED. IsRunningAsHostedService: {IsHostedService}, CurrentSettings.BaseDirectory: '{BaseDir}', CurrentSettings.LogFilePattern: '{Pattern}'", 
-                _isRunningAsHostedService, CurrentSettings.BaseDirectory, CurrentSettings.LogFilePattern);
+            _logger.LogInformation("StartProcessingAsyncInternal called.");
 
-            if (IsProcessing)
+            if (!_isRunningAsHostedService && IsProcessing) 
             {
-                _logger.LogWarning("Processing is already active, internal start request ignored.");
+                _logger.LogInformation("StartProcessingAsyncInternal: UI-Managed mode and already processing. No action needed.");
+                return;
+            }
+            if (_isRunningAsHostedService && IsProcessing)
+            {
+                _logger.LogWarning("StartProcessingAsyncInternal: Hosted service mode and already processing. This might indicate a logic issue or re-entrant call. CurrentFile: {CurrentFile}", CurrentFile);
+                // Depending on desired behavior, might return or reset some state.
+                // For now, allow to proceed, which might re-process or continue existing.
+            }
+
+            // Ensure PositionManager is initialized and loads positions from file
+            if (_positionManager != null)
+            {
+                _logger.LogInformation("StartProcessingAsyncInternal: Initializing PositionManager...");
+                try
+                {
+                    await _positionManager.InitializeAsync(_stoppingCts.Token).ConfigureAwait(false);
+                    _logger.LogInformation("StartProcessingAsyncInternal: PositionManager initialized successfully.");
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogWarning("StartProcessingAsyncInternal: PositionManager initialization was cancelled.");
+                    IsProcessing = false; // Stop if we can't initialize positions
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "StartProcessingAsyncInternal: Error initializing PositionManager. File positions may not be loaded correctly.");
+                    NotifyError("PositionManagerInit", $"Failed to initialize positions: {ex.Message}");
+                    IsProcessing = false; // Stop if we can't initialize positions
+                    return;
+                }
+            }
+            else
+            {
+                _logger.LogError("StartProcessingAsyncInternal: _positionManager is null. Cannot initialize or use positions.");
+                NotifyError("CriticalError", "PositionManager is not available. File processing cannot proceed correctly.");
+                IsProcessing = false;
                 return;
             }
 
-            if (string.IsNullOrWhiteSpace(CurrentSettings.BaseDirectory))
-            {
-                _logger.LogWarning("Cannot start processing - no directory configured");
-                NotifyError("Configuration", "Log directory is not configured. Please configure a directory first.");
-                return;
-            }
-            
-            if (!Directory.Exists(CurrentSettings.BaseDirectory))
-            {
-                _logger.LogWarning("Cannot start processing - directory {Directory} does not exist", CurrentSettings.BaseDirectory);
-                NotifyError("File System", $"Directory {CurrentSettings.BaseDirectory} does not exist. Please check the configuration.");
-                return;
-            }
-            
-            if (!_positionManager.PositionsFileExists())
-            {
-                _logger.LogWarning("Positions file doesn't exist at startup. Will create a new one with initial positions.");
-            }
-            
             IsProcessing = true;
-            _logger.LogInformation("Log file processing has been set to ACTIVE (IsProcessing: {IsProcessing}) by StartProcessingAsyncInternal.", IsProcessing);
-            
+            _lastProcessingError = null;
+            _logger.LogInformation("Processing started. IsProcessing: {IsProcessing}", IsProcessing);
+
             await InitializeAndProcessFilesOnStartAsync(_stoppingCts.Token);
             
             _logger.LogInformation("Initial file processing complete (if any files were found). Polling loop will continue if service is running.");
@@ -1346,6 +1401,7 @@ namespace Log2Postgres.Core.Services
             {
                 await ProcessExistingFilesAsync(cancellationToken);
             }
+            await SendCurrentStatusToIpcClientAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // New method for UI-initiated stop
@@ -1389,25 +1445,10 @@ namespace Log2Postgres.Core.Services
             CurrentPosition = 0;
             // TotalLinesProcessed is not reset here, it's a cumulative count for the session/instance.
 
-            // Reset _stoppingCts for the next potential start via UIManagedStartProcessingAsync
-            // _stoppingCts = new CancellationTokenSource(); // This was in StopAsync, consider if needed here.
-            // For UI managed start/stop, _stoppingCts should ideally be fresh per Start operation.
-            // However, if ExecuteAsync is also using it for a PollingLoopAsync that runs regardless of UI start/stop, then it's more complex.
-            // Given UIManagedStartProcessingAsync passes _stoppingCts.Token to InitialSetupAsync and StartProcessingAsyncInternal,
-            // it seems _stoppingCts is indeed meant for the lifetime of a processing session initiated by UI or service start.
-            // It gets cancelled on StopAsync (service) or UIManagedStopProcessing (UI).
-            // It should be re-created before the next UIManagedStartProcessingAsync or ExecuteAsync call that uses it.
-            // Let's assume the _stoppingCts used in UIManagedStartProcessingAsync is this class's main _stoppingCts.
-            // The original _stoppingCts is created with `new()` when the class is instantiated. 
-            // It's passed to ExecuteAsync. ExecuteAsync registers on it. 
-            // UIManagedStart uses it. StopAsync cancels it. UIManagedStopProcessing cancels it.
-            // This means after a stop (either service or UI), the main _stoppingCts is cancelled.
-            // If UIManagedStartProcessingAsync is called again, it will use an already cancelled token for InitialSetup and StartProcessingInternal.
-            // This is a bug. _stoppingCts needs to be fresh for each processing session (UI managed or service start).
-            // Let's fix this in Start/Stop methods more broadly.
-
             _logger.LogInformation("UIManagedStopProcessing: Completed.");
             ProcessingStatusChanged?.Invoke(CurrentFile, TotalLinesProcessed, CurrentPosition); // Notify UI of stopped state
+            // Task.Run needed because UIManagedStopProcessing is void
+            _ = Task.Run(() => SendCurrentStatusToIpcClientAsync(CancellationToken.None).ConfigureAwait(false));
         }
 
         private string GetOperationalStateString()
