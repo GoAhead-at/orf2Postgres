@@ -18,21 +18,6 @@ namespace Log2Postgres
         [STAThread]
         public static void Main(string[] args) // Changed back to void Main for STA simplicity with WPF
         {
-            // Write to a diagnostic file immediately to confirm Main execution and capture args
-            // For service context, AppContext.BaseDirectory might be System32, ensure writable path or adjust.
-            // However, current AppContext.BaseDirectory seems to be the app's dir.
-            var programMainStartLog = Path.Combine(AppContext.BaseDirectory, "Program_Main_Start.txt");
-            try
-            {
-                File.AppendAllText(programMainStartLog, $"Program.Main started at {DateTime.Now:dd.MM.yyyy HH:mm:ss}\nAppContext.BaseDirectory: {AppContext.BaseDirectory}\nArgs: {string.Join(" ", args)}\n---\n");
-            }
-            catch (Exception ex)
-            {
-                // Fallback if AppContext.BaseDirectory is not writable or another issue
-                var fallbackLogPath = Path.Combine(Path.GetTempPath(), "Log2Postgres_Program_Main_Start_FAIL.txt");
-                File.AppendAllText(fallbackLogPath, $"Program.Main started at {DateTime.Now:dd.MM.yyyy HH:mm:ss}\nError writing to AppContext.BaseDirectory log: {ex.Message}\nArgs: {string.Join(" ", args)}\n---\n");
-            }
-
             // Handle install/uninstall directly as before, as these are command-line utilities
             // and don't need the full host or WPF app.
             bool installRequested = args.Contains("--install", StringComparer.OrdinalIgnoreCase);
@@ -85,21 +70,14 @@ namespace Log2Postgres
                  Console.WriteLine($"[Program.Main] Error getting logger or logging run mode: {ex.Message}");
             }
 
-            var runModeLogPath = Path.Combine(AppContext.BaseDirectory, runAsService ? "Program_Main_ServicePath.txt" : "Program_Main_UIPath.txt");
-            File.AppendAllText(runModeLogPath, $"Program.Main: Determined runAsService = {runAsService} at {DateTime.Now:o}\n");
-
             if (runAsService)
             {
-                string serviceLifecycleLog = Path.Combine(AppContext.BaseDirectory, "Program_Main_Service_Lifecycle.txt");
                 try
                 {
-                    File.AppendAllText(serviceLifecycleLog, $"[{DateTime.Now:o}] SERVICE_PATH: About to call host.RunAsync().GetAwaiter().GetResult().\n");
                     host.RunAsync().GetAwaiter().GetResult(); // Blocking call for service
-                    File.AppendAllText(serviceLifecycleLog, $"[{DateTime.Now:o}] SERVICE_PATH: host.RunAsync().GetAwaiter().GetResult() completed (service is shutting down normally).\n");
                 }
                 catch (Exception ex)
                 {
-                    File.AppendAllText(serviceLifecycleLog, $"[{DateTime.Now:o}] SERVICE_PATH: CRITICAL EXCEPTION during host.RunAsync() or related service operations: {ex.ToString()}\n");
                     // Rethrow the exception so the SCM knows the service failed to start/run
                     throw;
                 }
@@ -109,7 +87,6 @@ namespace Log2Postgres
                 // Run as a Desktop WPF application. This path MUST be STA.
                 try
                 {
-                    File.AppendAllText(runModeLogPath, $"Program.Main: UI Path - Starting host and running WPF App at {DateTime.Now:o}\n");
                     // Start the host synchronously to ensure we don't leave STA context
                     host.Start(); 
                     Console.WriteLine("[Program.Main] Host started. Initializing and running WPF App.");
@@ -123,10 +100,8 @@ namespace Log2Postgres
                 }
                 catch (Exception ex)
                 {
-                    string errorLogPath = Path.Combine(AppContext.BaseDirectory, "wpf_startup_crash.txt");
-                    File.WriteAllText(errorLogPath, $"WPF application crashed at startup: {ex.ToString()}");
                     System.Windows.MessageBox.Show(
-                        $"Fatal error during WPF application startup: {ex.Message}\\n\\nFull details logged to: {errorLogPath}",
+                        $"Fatal error during WPF application startup: {ex.Message}",
                         "Startup Crash",
                         System.Windows.MessageBoxButton.OK,
                         System.Windows.MessageBoxImage.Error);

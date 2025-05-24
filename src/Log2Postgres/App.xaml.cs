@@ -44,37 +44,22 @@ namespace Log2Postgres
             _host = host ?? throw new ArgumentNullException(nameof(host));
             InitializeGlobalErrorHandling();
             Console.WriteLine("[App..ctor(IHost)] Constructor with IHost called. This is expected for Program.Main driven UI.");
-            LogDiagnostic("[App..ctor(IHost)] Constructor with IHost called.");
         }
 
         public App()
         {
             InitializeGlobalErrorHandling();
             Console.WriteLine("[App..ctor] PARAMETERLESS App constructor called! This is UNEXPECTED in Program.Main driven flow. The application might be misconfigured or starting up incorrectly. An IHost should be provided.");
-            LogDiagnostic("[App..ctor] PARAMETERLESS App constructor called!");
             
             _host = null;
         }
 
         private void InitializeGlobalErrorHandling()
         {
-            try
-            {
-                File.WriteAllText(Path.Combine(AppContext.BaseDirectory, "App_Constructor_Start.txt"), $"App constructor/init called at {DateTime.Now}\\nAppCcontext.BaseDirectory: {AppContext.BaseDirectory}");
-            }
-            catch { /* ignore */ }
-
-            var selfLogFilePath = Path.Combine(AppContext.BaseDirectory, "Log2Postgres_Serilog_SelfLog_AppDir.txt");
+            // Set up Serilog self-logging to console instead of file
             Serilog.Debugging.SelfLog.Enable(msg => 
             {
-                try 
-                {
-                    File.AppendAllText(selfLogFilePath, $"[{DateTime.Now:o}] {msg}{Environment.NewLine}");
-                }
-                catch 
-                {
-                    Console.Error.WriteLine("[SelfLog-FileError] ({selfLogFilePath}): " + msg);
-                }
+                Console.Error.WriteLine($"[SelfLog]: {msg}");
             });
 
             string errorFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "startup_error.txt");
@@ -145,32 +130,6 @@ namespace Log2Postgres
 
         public static IHostBuilder CreateHostBuilder(string[]? args = null)
         {
-            LogDiagnostic("[CreateHostBuilder] Entered.");
-
-            string diagLogPath = Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt");
-            try
-            {
-                string initialArgs = (args == null) ? "null" : $"['{string.Join("','", args)}']";
-                string envArgsLine = "null";
-                try { envArgsLine = $"['{string.Join("','", Environment.GetCommandLineArgs())}']"; } catch {}
-                string userInteractiveLine = "unknown";
-                try { userInteractiveLine = Environment.UserInteractive.ToString(); } catch {}
-
-                File.AppendAllText(diagLogPath, 
-                    $"[{DateTime.Now:o}] CreateHostBuilder ENTERED.\n" +
-                    $"  Passed args: {initialArgs}\n" +
-                    $"  Environment.UserInteractive: {userInteractiveLine}\n" +
-                    $"  Environment.GetCommandLineArgs(): {envArgsLine}\n");
-            }
-            catch (Exception exDiag)
-            {
-                try { 
-                    File.AppendAllText(diagLogPath, $"[{DateTime.Now:o}] ERROR writing diag log: {exDiag.Message}{Environment.NewLine}");
-                    LogDiagnostic($"[CreateHostBuilder] ERROR writing diag log: {exDiag.Message}");
-                }
-                catch { /* utterly failed */ }
-            }
-
             var effectiveArgs = args ?? Environment.GetCommandLineArgs();
             string commandLineForLog = string.Join(" ", effectiveArgs);
 
@@ -178,17 +137,6 @@ namespace Log2Postgres
             bool hasServiceArgument = effectiveArgs.Contains("--windows-service", StringComparer.OrdinalIgnoreCase);
             
             bool runAsService = isLaunchedBySCM || hasServiceArgument;
-
-            try
-            {
-                File.AppendAllText(diagLogPath,
-                    $"  EffectiveArgs for Contains check: ['{string.Join("','", effectiveArgs)}']{Environment.NewLine}" +
-                    $"  isLaunchedBySCM (!UserInteractive): {isLaunchedBySCM}{Environment.NewLine}" +
-                    $"  hasServiceArgument (--windows-service): {hasServiceArgument}{Environment.NewLine}" +
-                    $"  DETERMINED runAsService: {runAsService}{Environment.NewLine}--{Environment.NewLine}");
-                LogDiagnostic($"[CreateHostBuilder] EffectiveArgs: {string.Join(",", effectiveArgs)}, UserInteractive: {!isLaunchedBySCM}, HasSvcArg: {hasServiceArgument}, runAsService: {runAsService}");
-            }
-            catch { /* ignore */ }
 
             // Console.WriteLine diagnostics remain but might not be visible in service context
             Console.WriteLine($"[App.CreateHostBuilder] DIAGNOSTIC: effectiveArgs = '{commandLineForLog}'");
@@ -212,60 +160,18 @@ namespace Log2Postgres
 
                 hostBuilder.UseSerilog((hostingContext, services, loggerConfiguration) => 
                 {
-                    string logDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
-                    string logFilePath = Path.Combine(logDirectory, "service_log_.txt");
-
-                    try
-                    {
-                        Directory.CreateDirectory(logDirectory);
-                        LogDiagnostic($"[CreateHostBuilder] SERVICE_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {logFilePath}");
-                        File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
-                            $"[{DateTime.Now:o}] SERVICE_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {logFilePath}{Environment.NewLine}");
-                    }
-                    catch (Exception ex)
-                    {
-                        LogDiagnostic($"[CreateHostBuilder] SERVICE_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}");
-                        File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
-                            $"[{DateTime.Now:o}] SERVICE_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}{Environment.NewLine}");
-                    }
-
                     loggerConfiguration
                         .ReadFrom.Configuration(hostingContext.Configuration)
-                        .Enrich.FromLogContext()
-                        .WriteTo.File(logFilePath, 
-                            rollingInterval: Serilog.RollingInterval.Day, 
-                            retainedFileCountLimit: 7,
-                            outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {Message:lj}{NewLine}{Exception}");
+                        .Enrich.FromLogContext();
                 });
             }
             else
             {
                 hostBuilder.UseSerilog((hostingContext, services, loggerConfiguration) => 
                 {
-                    string logDirectory = Path.Combine(AppContext.BaseDirectory, "logs");
-                    string uiLogFilePath = Path.Combine(logDirectory, "ui_log_.txt"); 
-
-                    try
-                    {
-                        Directory.CreateDirectory(logDirectory);
-                        LogDiagnostic($"[CreateHostBuilder] UI_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {uiLogFilePath}");
-                        File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
-                           $"[{DateTime.Now:o}] UI_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {uiLogFilePath}{Environment.NewLine}");
-                    }
-                    catch (Exception ex)
-                    {
-                        LogDiagnostic($"[CreateHostBuilder] UI_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}");
-                        File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
-                           $"[{DateTime.Now:o}] UI_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}{Environment.NewLine}");
-                    }
-                    
                     loggerConfiguration
                         .ReadFrom.Configuration(hostingContext.Configuration)
-                        .Enrich.FromLogContext()
-                        .WriteTo.File(uiLogFilePath, 
-                            rollingInterval: Serilog.RollingInterval.Day, 
-                            retainedFileCountLimit: 7,
-                            outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] {Message:lj}{NewLine}{Exception}");
+                        .Enrich.FromLogContext();
                 });
             }
 
@@ -357,58 +263,40 @@ namespace Log2Postgres
 
         protected override async void OnStartup(StartupEventArgs e)
         {
-            string onStartupLog = Path.Combine(AppContext.BaseDirectory, "OnStartup_Log.txt");
             try
             {
-                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] OnStartup ENTERED. Args: {string.Join(", ", e.Args)}\n");
-
                 bool isServiceMode = IsRunningAsService();
-                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] IsRunningAsService evaluated to: {isServiceMode}\n");
 
                 if (!isServiceMode)
                 {
-                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Not service mode. Attempting to acquire Mutex: {MutexName}\n");
                     _singleInstanceMutex = new Mutex(true, MutexName, out bool createdNew);
                     if (!createdNew)
                     {
-                        File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Mutex not created (already exists). Activating existing instance and shutting down.\n");
                         ActivateExistingInstance();
                         Shutdown();
                         return;
                     }
-                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Mutex acquired.\n");
-                }
-                else
-                {
-                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Service mode. Skipping Mutex logic.\n");
                 }
 
                 base.OnStartup(e);
-                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] base.OnStartup(e) completed.\n");
 
                 if (_host == null)
                 {
-                     File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Host is null. Building it now.\n");
                     _host = CreateHostBuilder(e.Args).Build();
                 }
                 
-                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Attempting to start host.\n");
                 await _host.StartAsync();
-                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Host started successfully.\n");
 
                 // Initialize PositionManager
                 var positionManager = _host.Services.GetService<PositionManager>();
                 if (positionManager != null)
                 {
-                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] PositionManager resolved. Attempting to initialize.\n");
                     try
                     {
                         await positionManager.InitializeAsync();
-                        File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] PositionManager initialized successfully.\n");
                     }
                     catch (Exception exInitialize)
                     {
-                        File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] ERROR initializing PositionManager: {exInitialize}\n");
                         // Decide how to handle this critical failure.
                         // For now, log and continue, but this might leave the app in a bad state.
                         System.Windows.MessageBox.Show($"Critical error initializing PositionManager: {exInitialize.Message}. Application might not work correctly.", 
@@ -417,7 +305,6 @@ namespace Log2Postgres
                 }
                 else
                 {
-                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] PositionManager could not be resolved from services.\n");
                      System.Windows.MessageBox.Show("Critical error: PositionManager service not found. Application cannot start.", 
                                     "Initialization Error", MessageBoxButton.OK, MessageBoxImage.Error);
                     Shutdown(-1); // Exit if PositionManager is essential and not found
@@ -426,17 +313,14 @@ namespace Log2Postgres
 
                 if (!isServiceMode)
                 {
-                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Not service mode. Creating and showing MainWindow.\n");
                     var mainWindow = _host.Services.GetService<MainWindow>();
                     if (mainWindow != null)
                     {
                         Current.MainWindow = mainWindow; // Set the main window
                         mainWindow.Show();
-                        File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] MainWindow shown.\n");
                     }
                     else
                     {
-                        File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] MainWindow could not be resolved. Shutting down.\n");
                         System.Windows.MessageBox.Show("Critical error: MainWindow could not be resolved. Application cannot start.", 
                                         "Startup Error", MessageBoxButton.OK, MessageBoxImage.Error);
                         Shutdown(-1);
@@ -445,15 +329,12 @@ namespace Log2Postgres
                 }
                 else
                 {
-                    File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] Service mode. MainWindow not shown. Application running as service.\n");
                     // In service mode, the host runs, but no UI is shown.
                     // The LogFileWatcher (BackgroundService) will be started by the host.
                 }
-                 File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] OnStartup COMPLETED.\n");
             }
             catch (Exception ex)
             {
-                File.AppendAllText(onStartupLog, $"[{DateTime.Now:o}] CRITICAL ERROR in OnStartup: {ex}\n");
                 System.Windows.MessageBox.Show($"A critical error occurred during application startup: {ex.Message}", "Startup Error", MessageBoxButton.OK, MessageBoxImage.Error);
                 // Ensure shutdown if error is catastrophic
                 if (Current != null && Current.MainWindow == null) // If main window never showed
@@ -476,32 +357,26 @@ namespace Log2Postgres
 
         protected override async void OnExit(ExitEventArgs e)
         {
-            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit ENTERED. ExitCode: {e.ApplicationExitCode}\n");
             Console.WriteLine($"[App.OnExit] Application exiting with code: {e.ApplicationExitCode}");
             
             if (_host != null)
             {
                 Console.WriteLine("[App.OnExit] Calling _host.StopAsync().");
-                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit: Calling _host.StopAsync().\n");
                 await _host.StopAsync(); // Await the host stop
                 _host.Dispose();
                 Console.WriteLine("[App.OnExit] _host stopped and disposed.");
-                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit: _host stopped and disposed.\n");
             }
             else
             {
                 Console.WriteLine("[App.OnExit] _host was null. No host stop/dispose action taken.");
-                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit: _host was null.\n");
             }
 
             _singleInstanceMutex?.ReleaseMutex();
             _singleInstanceMutex?.Dispose();
             Console.WriteLine("[App.OnExit] Single instance mutex released and disposed.");
-            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit: Mutex released/disposed.\n");
 
             Serilog.Log.CloseAndFlush();
             Console.WriteLine("[App.OnExit] Serilog closed and flushed.");
-            File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Lifecycle.txt"), $"[{DateTime.Now:o}] OnExit: Serilog flushed. EXITED NORMALLY.\n");
             base.OnExit(e);
         }
 
@@ -716,14 +591,7 @@ namespace Log2Postgres
             }
         }
 
-        private static void LogDiagnostic(string message)
-        {
-            try
-            {
-                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Constructor_Diag.txt"), $"[{DateTime.Now:o}] {message}{Environment.NewLine}");
-            }
-            catch { /* ignore */ }
-        }
+
     }
 
     internal class ApplicationLifetime : IHostApplicationLifetime
