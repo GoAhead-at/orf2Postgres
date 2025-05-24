@@ -43,13 +43,17 @@ namespace Log2Postgres
         {
             _host = host ?? throw new ArgumentNullException(nameof(host));
             InitializeGlobalErrorHandling();
+            Console.WriteLine("[App..ctor(IHost)] Constructor with IHost called. This is expected for Program.Main driven UI.");
+            LogDiagnostic("[App..ctor(IHost)] Constructor with IHost called.");
         }
 
         public App()
         {
             InitializeGlobalErrorHandling();
-            Console.WriteLine("[App..ctor] Parameterless constructor called. Building its own host.");
-            _host = CreateHostBuilder(Environment.GetCommandLineArgs()).Build();
+            Console.WriteLine("[App..ctor] PARAMETERLESS App constructor called! This is UNEXPECTED in Program.Main driven flow. The application might be misconfigured or starting up incorrectly. An IHost should be provided.");
+            LogDiagnostic("[App..ctor] PARAMETERLESS App constructor called!");
+            
+            _host = null;
         }
 
         private void InitializeGlobalErrorHandling()
@@ -141,7 +145,8 @@ namespace Log2Postgres
 
         public static IHostBuilder CreateHostBuilder(string[]? args = null)
         {
-            // VERY EARLY DIAGNOSTIC LOGGING - BEFORE ANYTHING ELSE
+            LogDiagnostic("[CreateHostBuilder] Entered.");
+
             string diagLogPath = Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt");
             try
             {
@@ -159,7 +164,10 @@ namespace Log2Postgres
             }
             catch (Exception exDiag)
             {
-                try { File.AppendAllText(diagLogPath, $"[{DateTime.Now:o}] ERROR writing diag log: {exDiag.Message}\n"); }
+                try { 
+                    File.AppendAllText(diagLogPath, $"[{DateTime.Now:o}] ERROR writing diag log: {exDiag.Message}{Environment.NewLine}");
+                    LogDiagnostic($"[CreateHostBuilder] ERROR writing diag log: {exDiag.Message}");
+                }
                 catch { /* utterly failed */ }
             }
 
@@ -171,14 +179,14 @@ namespace Log2Postgres
             
             bool runAsService = isLaunchedBySCM || hasServiceArgument;
 
-            // Log determination factors AFTER attempting to log them above
             try
             {
                 File.AppendAllText(diagLogPath,
-                    $"  EffectiveArgs for Contains check: ['{string.Join("','", effectiveArgs)}']\n" +
-                    $"  isLaunchedBySCM (!UserInteractive): {isLaunchedBySCM}\n" +
-                    $"  hasServiceArgument (--windows-service): {hasServiceArgument}\n" +
-                    $"  DETERMINED runAsService: {runAsService}\n---\n");
+                    $"  EffectiveArgs for Contains check: ['{string.Join("','", effectiveArgs)}']{Environment.NewLine}" +
+                    $"  isLaunchedBySCM (!UserInteractive): {isLaunchedBySCM}{Environment.NewLine}" +
+                    $"  hasServiceArgument (--windows-service): {hasServiceArgument}{Environment.NewLine}" +
+                    $"  DETERMINED runAsService: {runAsService}{Environment.NewLine}--{Environment.NewLine}");
+                LogDiagnostic($"[CreateHostBuilder] EffectiveArgs: {string.Join(",", effectiveArgs)}, UserInteractive: {!isLaunchedBySCM}, HasSvcArg: {hasServiceArgument}, runAsService: {runAsService}");
             }
             catch { /* ignore */ }
 
@@ -210,13 +218,15 @@ namespace Log2Postgres
                     try
                     {
                         Directory.CreateDirectory(logDirectory);
+                        LogDiagnostic($"[CreateHostBuilder] SERVICE_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {logFilePath}");
                         File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
-                            $"[{DateTime.Now:o}] SERVICE_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {logFilePath}\n");
+                            $"[{DateTime.Now:o}] SERVICE_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {logFilePath}{Environment.NewLine}");
                     }
                     catch (Exception ex)
                     {
+                        LogDiagnostic($"[CreateHostBuilder] SERVICE_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}");
                         File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
-                            $"[{DateTime.Now:o}] SERVICE_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}\n");
+                            $"[{DateTime.Now:o}] SERVICE_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}{Environment.NewLine}");
                     }
 
                     loggerConfiguration
@@ -238,13 +248,15 @@ namespace Log2Postgres
                     try
                     {
                         Directory.CreateDirectory(logDirectory);
+                        LogDiagnostic($"[CreateHostBuilder] UI_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {uiLogFilePath}");
                         File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
-                           $"[{DateTime.Now:o}] UI_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {uiLogFilePath}\n");
+                           $"[{DateTime.Now:o}] UI_LOG_PATH_SETUP: Ensured directory exists: {logDirectory}. Logging to: {uiLogFilePath}{Environment.NewLine}");
                     }
                     catch (Exception ex)
                     {
+                        LogDiagnostic($"[CreateHostBuilder] UI_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}");
                         File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "CreateHostBuilder_Diag.txt"),
-                           $"[{DateTime.Now:o}] UI_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}\n");
+                           $"[{DateTime.Now:o}] UI_LOG_PATH_SETUP_ERROR: Failed to create directory {logDirectory}: {ex.Message}{Environment.NewLine}");
                     }
                     
                     loggerConfiguration
@@ -690,6 +702,15 @@ namespace Log2Postgres
                 Console.WriteLine($"Exception during service stop: {ex.Message}");
                 System.Windows.MessageBox.Show($"Exception during service stop: {ex.Message}", "Service Stop Exception", MessageBoxButton.OK, MessageBoxImage.Error);
             }
+        }
+
+        private static void LogDiagnostic(string message)
+        {
+            try
+            {
+                File.AppendAllText(Path.Combine(AppContext.BaseDirectory, "App_Constructor_Diag.txt"), $"[{DateTime.Now:o}] {message}{Environment.NewLine}");
+            }
+            catch { /* ignore */ }
         }
     }
 

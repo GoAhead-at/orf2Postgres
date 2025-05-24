@@ -676,125 +676,386 @@ namespace Log2Postgres.Core.Services
         /// </summary>
         private async Task RunIpcServerAsync(CancellationToken cancellationToken)
         {
-            _logger.LogInformation("Starting IPC server on pipe '{PipeName}'...", PipeName);
+            _logger.LogInformation("Starting IPC server on pipe '{PipeName}' with concurrent connection support...", PipeName);
+            
+            // Use multiple concurrent server instances for better availability
+            const int maxConcurrentServers = 3;
+            var serverTasks = new List<Task>();
+            
             try
             {
-                while (!cancellationToken.IsCancellationRequested)
+                // Create multiple server instances to handle concurrent connections
+                for (int i = 0; i < maxConcurrentServers; i++)
                 {
-                    // Corrected NamedPipeServerStream creation using NamedPipeServerStreamAcl.Create
-                    NamedPipeServerStream serverStream = NamedPipeServerStreamAcl.Create(
-                        PipeName,
-                        PipeDirection.InOut,
-                        NamedPipeServerStream.MaxAllowedServerInstances,
-                        PipeTransmissionMode.Byte,
-                        PipeOptions.Asynchronous,
-                        0, // Default in buffer size (usually 4096)
-                        0, // Default out buffer size (usually 4096)
-                        CreatePipeSecurity() // Apply PipeSecurity
-                    );
-
-                    _logger.LogDebug("IPC Server: Pipe stream created via ACL method. Waiting for a client connection...");
-                    await serverStream.WaitForConnectionAsync(cancellationToken);
-                    _logger.LogInformation("IPC Server: Client connected.");
-                    _ipcServerReadySignal.TrySetResult(true); // Signal that server is ready and client connected
-
-                    // Client connected, handle communication
-                    _ipcClientStreamWriter = new StreamWriter(serverStream, Encoding.UTF8) { AutoFlush = true };
-                    var clientReader = new StreamReader(serverStream, Encoding.UTF8);
-
-                    try
+                    var serverTask = Task.Run(async () =>
                     {
-                        while (!cancellationToken.IsCancellationRequested && serverStream.IsConnected)
+                        int restartCount = 0;
+                        const int maxRestarts = 10;
+                        TimeSpan baseDelay = TimeSpan.FromSeconds(1);
+                        
+                        while (!cancellationToken.IsCancellationRequested && restartCount < maxRestarts)
                         {
-                            string? messageJson = await clientReader.ReadLineAsync(cancellationToken);
-                            if (messageJson == null)
+                            try
                             {
-                                _logger.LogInformation("IPC Server: Client disconnected (null received).");
-                                break; // Client disconnected
-                            }
-                            // Restored call to ProcessIpcMessageAsync
-                            await ProcessIpcMessageAsync(messageJson, cancellationToken);
-                        }
-                    }
-                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-                    {
-                        _logger.LogInformation("IPC Server: Operation cancelled during client communication.");
-                    }
-                    catch (IOException ex)
-                    {
-                        _logger.LogWarning(ex, "IPC Server: IOException during client communication (e.g., pipe broken).");
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "IPC Server: Error during client communication.");
-                    }
-                    finally
-                    {
-                        _logger.LogInformation("IPC Server: Cleaning up client connection.");
-                        lock (_ipcClientWriterLock)
-                        {
-                            _ipcClientStreamWriter?.Dispose();
-                            _ipcClientStreamWriter = null;
-                        }
-                        clientReader.Dispose();
-                        if (serverStream.IsConnected) // Should be false if broken, but good practice
-                        {
-                            try { serverStream.Disconnect(); } catch (Exception exDisc) { _logger.LogWarning(exDisc, "IPC Server: Exception during serverStream.Disconnect()."); }
-                        }
-                        serverStream.Dispose();
-                        _logger.LogInformation("IPC Server: Client connection resources released.");
-                    }
+                                if (restartCount > 0)
+                                {
+                                    var delay = TimeSpan.FromMilliseconds(baseDelay.TotalMilliseconds * Math.Pow(2, Math.Min(restartCount - 1, 5)));
+                                    _logger.LogInformation("IPC Server Instance {Instance}: Restarting (attempt {RestartCount}/{MaxRestarts}) after {Delay}ms delay...", 
+                                        i, restartCount + 1, maxRestarts, delay.TotalMilliseconds);
+                                    await Task.Delay(delay, cancellationToken);
+                                }
 
-                    if (cancellationToken.IsCancellationRequested)
-                    {
-                        _logger.LogInformation("IPC Server: Cancellation requested after client handling, breaking server loop.");
-                        _ipcServerReadySignal.TrySetCanceled(cancellationToken); // Reflect cancellation if it occurs before connection
-                        break;
-                    }
-                    // After client disconnects, loop to wait for a new connection
-                    _logger.LogInformation("IPC Server: Client disconnected, looping to wait for new connection.");
-                    // Reset the ready signal for the next connection if UIManagedStartProcessingAsync can be called multiple times
-                    // or if it's intended to signal each client connection. For now, it signals first successful server setup.
-                    // If _ipcServerReadySignal is awaited by UIManagedStartProcessingAsync only once per start, 
-                    // then this TrySetResult(true) is for that initial setup. Subsequent connections won't re-trigger it unless reset.
+                                await RunSingleIpcServerInstanceAsync(cancellationToken, i);
+                                
+                                // If we get here, the server exited gracefully (probably due to cancellation)
+                                _logger.LogInformation("IPC Server Instance {Instance}: Server instance exited gracefully.", i);
+                                break;
+                            }
+                            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                            {
+                                _logger.LogInformation("IPC server instance {Instance} task cancelled.", i);
+                                if (i == 0) _ipcServerReadySignal.TrySetCanceled(cancellationToken);
+                                break;
+                            }
+                            catch (Exception ex)
+                            {
+                                restartCount++;
+                                _logger.LogError(ex, "Critical error in IPC server instance {Instance} (restart {RestartCount}). Will attempt restart if under limit.", i, restartCount);
+                                
+                                if (restartCount >= maxRestarts)
+                                {
+                                    _logger.LogError("IPC Server Instance {Instance}: Maximum restart attempts ({MaxRestarts}) reached. Giving up.", i, maxRestarts);
+                                    if (i == 0) _ipcServerReadySignal.TrySetException(ex);
+                                    break;
+                                }
+                            }
+                        }
+                    }, cancellationToken);
+                    
+                    serverTasks.Add(serverTask);
                 }
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                _logger.LogInformation("IPC server task cancelled.");
-                _ipcServerReadySignal.TrySetCanceled(cancellationToken);
+                
+                // Wait for all server instances to complete
+                await Task.WhenAll(serverTasks);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Critical error in IPC server task.");
-                _ipcServerReadySignal.TrySetException(ex); 
+                _logger.LogError(ex, "Fatal error in IPC server management.");
+                _ipcServerReadySignal.TrySetException(ex);
+            }
+            
+            _logger.LogInformation("IPC server task shutting down.");
+        }
+
+        private async Task RunSingleIpcServerInstanceAsync(CancellationToken cancellationToken, int instanceId = 0)
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                NamedPipeServerStream? serverStream = null;
+                try
+                {
+                    // Create pipe server stream with better configuration
+                    serverStream = NamedPipeServerStreamAcl.Create(
+                        PipeName,
+                        PipeDirection.InOut,
+                        NamedPipeServerStream.MaxAllowedServerInstances, // Allow multiple instances
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous | PipeOptions.WriteThrough, // Add WriteThrough for better responsiveness
+                        4096, // Input buffer size
+                        4096, // Output buffer size
+                        CreatePipeSecurity()
+                    );
+
+                    _logger.LogDebug("IPC Server Instance {Instance}: Pipe stream created. Waiting for client connection...", instanceId);
+                    
+                    // Wait for connection with timeout to allow cancellation checks
+                    using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    timeoutCts.CancelAfter(TimeSpan.FromSeconds(30)); // 30-second timeout for connection wait
+                    
+                    try
+                    {
+                        await serverStream.WaitForConnectionAsync(timeoutCts.Token);
+                    }
+                    catch (OperationCanceledException) when (timeoutCts.Token.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+                    {
+                        // Timeout occurred, but main cancellation wasn't requested - continue waiting
+                        _logger.LogTrace("IPC Server Instance {Instance}: Connection wait timeout, retrying...", instanceId);
+                        serverStream.Dispose();
+                        continue;
+                    }
+                    
+                    _logger.LogInformation("IPC Server Instance {Instance}: Client connected.", instanceId);
+                    
+                    // Signal ready on first successful connection
+                    if (instanceId == 0)
+                    {
+                        _ipcServerReadySignal.TrySetResult(true);
+                    }
+
+                    // Handle client communication
+                    await HandleClientCommunicationAsync(serverStream, cancellationToken, instanceId);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogInformation("IPC Server Instance {Instance}: Connection wait was cancelled.", instanceId);
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "IPC Server Instance {Instance}: Error in server loop.", instanceId);
+                    throw; // Re-throw to trigger restart at the higher level
+                }
+                finally
+                {
+                    serverStream?.Dispose();
+                }
+
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogInformation("IPC Server Instance {Instance}: Cancellation requested, exiting server loop.", instanceId);
+                    break;
+                }
+                
+                // Brief delay before accepting next connection
+                try
+                {
+                    await Task.Delay(100, cancellationToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+
+        private async Task HandleClientCommunicationAsync(NamedPipeServerStream serverStream, CancellationToken cancellationToken, int instanceId)
+        {
+            StreamWriter? localWriter = null;
+            StreamReader? clientReader = null;
+            
+            try
+            {
+                // Create local communication streams
+                localWriter = new StreamWriter(serverStream, Encoding.UTF8) { AutoFlush = false };
+                clientReader = new StreamReader(serverStream, Encoding.UTF8);
+
+                // Set the global writer only if it's not already set (first connection wins)
+                bool isGlobalWriter = false;
+                lock (_ipcClientWriterLock)
+                {
+                    if (_ipcClientStreamWriter == null)
+                    {
+                        _ipcClientStreamWriter = localWriter;
+                        isGlobalWriter = true;
+                        _logger.LogInformation("IPC Server Instance {Instance}: Set as global writer.", instanceId);
+                    }
+                    else
+                    {
+                        _logger.LogDebug("IPC Server Instance {Instance}: Another instance is already the global writer.", instanceId);
+                    }
+                }
+
+                // Send initial status to newly connected client
+                if (isGlobalWriter)
+                {
+                    try
+                    {
+                        await SendCurrentStatusToIpcClientAsync(cancellationToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "IPC Server Instance {Instance}: Failed to send initial status.", instanceId);
+                    }
+                }
+
+                // Handle incoming messages
+                while (!cancellationToken.IsCancellationRequested && serverStream.IsConnected)
+                {
+                    string? messageJson = null;
+                    try
+                    {
+                        // Use a timeout for reading to allow periodic checks
+                        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                        readCts.CancelAfter(TimeSpan.FromSeconds(10));
+                        
+                        messageJson = await clientReader.ReadLineAsync(readCts.Token);
+                        
+                        if (messageJson == null)
+                        {
+                            _logger.LogInformation("IPC Server Instance {Instance}: Client disconnected (null received).", instanceId);
+                            break;
+                        }
+                        
+                        // Process the message using the instance's writer
+                        await ProcessIpcMessageAsync(messageJson, localWriter, cancellationToken, instanceId);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        _logger.LogInformation("IPC Server Instance {Instance}: Operation cancelled during client communication.", instanceId);
+                        break;
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Read timeout - continue loop for periodic cancellation checks
+                        continue;
+                    }
+                    catch (IOException ex)
+                    {
+                        _logger.LogWarning(ex, "IPC Server Instance {Instance}: IOException during client communication (pipe broken).", instanceId);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "IPC Server Instance {Instance}: Error during client communication.", instanceId);
+                        break;
+                    }
+                }
             }
             finally
             {
-                _logger.LogInformation("IPC server task shutting down.");
+                // Clean up this instance's connection
+                await CleanupClientConnectionAsync(serverStream, clientReader, localWriter, instanceId, cancellationToken);
+            }
+        }
+
+        private async Task CleanupClientConnectionAsync(NamedPipeServerStream serverStream, StreamReader? clientReader, StreamWriter? localWriter, int instanceId, CancellationToken cancellationToken)
+        {
+            try
+            {
+                _logger.LogInformation("IPC Server Instance {Instance}: Cleaning up client connection.", instanceId);
+
+                // Clear global writer if this instance was using it
+                lock (_ipcClientWriterLock)
+                {
+                    if (_ipcClientStreamWriter == localWriter)
+                    {
+                        _ipcClientStreamWriter = null;
+                        _logger.LogInformation("IPC Server Instance {Instance}: Cleared global writer.", instanceId);
+                    }
+                }
+
+                // Dispose streams
+                if (localWriter != null)
+                {
+                    try
+                    {
+                        await localWriter.DisposeAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "IPC Server Instance {Instance}: Exception disposing StreamWriter.", instanceId);
+                    }
+                }
+
+                if (clientReader != null)
+                {
+                    try
+                    {
+                        clientReader.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "IPC Server Instance {Instance}: Exception disposing StreamReader.", instanceId);
+                    }
+                }
+
+                // Disconnect server stream
+                if (serverStream.IsConnected)
+                {
+                    try 
+                    { 
+                        serverStream.Disconnect(); 
+                    } 
+                    catch (Exception ex) 
+                    { 
+                        _logger.LogWarning(ex, "IPC Server Instance {Instance}: Exception during serverStream.Disconnect().", instanceId); 
+                    }
+                }
+
+                _logger.LogInformation("IPC Server Instance {Instance}: Client connection resources released.", instanceId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "IPC Server Instance {Instance}: Unexpected error during cleanup.", instanceId);
+            }
+        }
+
+        private async Task SendIpcResponseSafelyAsync(string jsonResponse, CancellationToken cancellationToken)
+        {
+            StreamWriter? writer = null;
+            lock (_ipcClientWriterLock)
+            {
+                writer = _ipcClientStreamWriter;
+            }
+
+            if (writer == null)
+            {
+                _logger.LogWarning("IPC Server: _ipcClientStreamWriter is null, cannot send response.");
+                throw new InvalidOperationException("IPC client writer is not available");
+            }
+
+            try
+            {
+                await writer.WriteLineAsync(jsonResponse.AsMemory(), cancellationToken).ConfigureAwait(false);
+                await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (IOException ex)
+            {
+                _logger.LogError(ex, "IPC Server: IOException during write/flush operation. Pipe may be broken.");
+                throw; // Re-throw to trigger server restart
+            }
+            catch (ObjectDisposedException ex)
+            {
+                _logger.LogError(ex, "IPC Server: ObjectDisposedException during write operation. Writer was disposed.");
+                throw; // Re-throw to trigger server restart
+            }
+        }
+
+        private async Task SendIpcResponseToInstanceAsync(StreamWriter writer, string jsonResponse, CancellationToken cancellationToken, int instanceId)
+        {
+            if (writer == null)
+            {
+                _logger.LogWarning("IPC Server Instance {Instance}: Writer is null, cannot send response.", instanceId);
+                throw new InvalidOperationException($"IPC instance {instanceId} writer is not available");
+            }
+
+            try
+            {
+                await writer.WriteLineAsync(jsonResponse.AsMemory(), cancellationToken).ConfigureAwait(false);
+                await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (IOException ex)
+            {
+                _logger.LogError(ex, "IPC Server Instance {Instance}: IOException during write/flush operation. Pipe may be broken.", instanceId);
+                throw; // Re-throw to trigger instance cleanup
+            }
+            catch (ObjectDisposedException ex)
+            {
+                _logger.LogError(ex, "IPC Server Instance {Instance}: ObjectDisposedException during write operation. Writer was disposed.", instanceId);
+                throw; // Re-throw to trigger instance cleanup
             }
         }
 
         // Restored ProcessIpcMessageAsync method
-        private async Task ProcessIpcMessageAsync(string messageJson, CancellationToken cancellationToken)
+        private async Task ProcessIpcMessageAsync(string messageJson, StreamWriter localWriter, CancellationToken cancellationToken, int instanceId)
         {
             try
             {
-                _logger.LogDebug("IPC Server: Received message: {MessageJson}", messageJson);
+                _logger.LogDebug("IPC Server Instance {Instance}: Received message: {MessageJson}", instanceId, messageJson);
                 var baseMessage = JsonConvert.DeserializeObject<IpcMessage<object>>(messageJson);
 
                 if (baseMessage == null || string.IsNullOrEmpty(baseMessage.Type))
                 {
-                    _logger.LogWarning("IPC Server: Received an invalid or untyped IPC message: {MessageJson}", messageJson);
+                    _logger.LogWarning("IPC Server Instance {Instance}: Received an invalid or untyped IPC message: {MessageJson}", instanceId, messageJson);
                     return;
                 }
 
-                _logger.LogDebug("IPC Server: Processing command of Type: {CommandType}", baseMessage.Type);
+                _logger.LogDebug("IPC Server Instance {Instance}: Processing command of Type: {CommandType}", instanceId, baseMessage.Type);
 
                 switch (baseMessage.Type)
                 {
                     case IpcMessageTypes.RequestState:
-                        _logger.LogDebug("IPC Server: Handling '{RequestStateType}' command.", IpcMessageTypes.RequestState);
+                        _logger.LogDebug("IPC Server Instance {Instance}: Handling '{RequestStateType}' command.", instanceId);
                         var statusPayload = new PipeServiceStatus
                         {
                             ServiceOperationalState = GetOperationalStateString(),
@@ -806,19 +1067,12 @@ namespace Log2Postgres.Core.Services
                         };
                         var responseMessage = new IpcMessage<PipeServiceStatus> { Type = IpcMessageTypes.StatusUpdate, Payload = statusPayload };
                         string jsonResponse = JsonConvert.SerializeObject(responseMessage);
-                         if (_ipcClientStreamWriter != null)
-                        {
-                            await _ipcClientStreamWriter.WriteLineAsync(jsonResponse.AsMemory(), cancellationToken).ConfigureAwait(false);
-                            _logger.LogInformation("IPC Server: Sent '{StatusUpdateType}' response to client: {JsonResponse}", IpcMessageTypes.StatusUpdate, jsonResponse);
-                        }
-                        else
-                        {
-                            _logger.LogWarning("IPC Server: _ipcClientStreamWriter is null, cannot send '{StatusUpdateType}' response.", IpcMessageTypes.StatusUpdate);
-                        }
+                        await SendIpcResponseToInstanceAsync(localWriter, jsonResponse, cancellationToken, instanceId);
+                        _logger.LogInformation("IPC Server Instance {Instance}: Sent '{StatusUpdateType}' response to client: {JsonResponse}", instanceId, IpcMessageTypes.StatusUpdate, jsonResponse);
                         break;
 
                     case "UpdateSettings":
-                        _logger.LogDebug("IPC Server: Handling 'UpdateSettings' command.");
+                        _logger.LogDebug("IPC Server Instance {Instance}: Handling 'UpdateSettings' command.", instanceId);
                         if (baseMessage.Payload != null)
                         {
                             try
@@ -826,96 +1080,82 @@ namespace Log2Postgres.Core.Services
                                 var settings = JsonConvert.DeserializeObject<LogMonitorSettings>(baseMessage.Payload.ToString() ?? string.Empty);
                                 if (settings != null)
                                 {
-                                    _logger.LogInformation("IPC Server: Received UpdateSettings request. Applying new settings.");
+                                    _logger.LogInformation("IPC Server Instance {Instance}: Received UpdateSettings request. Applying new settings.", instanceId);
                                     await UpdateSettingsAsync(settings); // Assuming this method exists and works
                                     // Acknowledge the settings update
-                                     if (_ipcClientStreamWriter != null)
-                                    {
-                                        var ackPayload = new { Status = "OK", Message = "Settings updated successfully." };
-                                        var ackResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateAck", Payload = ackPayload };
-                                        await _ipcClientStreamWriter.WriteLineAsync(JsonConvert.SerializeObject(ackResponseMessage).AsMemory(), cancellationToken);
-                                    }
+                                    var ackPayload = new { Status = "OK", Message = "Settings updated successfully." };
+                                    var ackResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateAck", Payload = ackPayload };
+                                    await SendIpcResponseToInstanceAsync(localWriter, JsonConvert.SerializeObject(ackResponseMessage), cancellationToken, instanceId);
                                 }
                                 else
                                 {
-                                    _logger.LogWarning("IPC Server: Failed to deserialize LogMonitorSettings from UpdateSettings command payload.");
-                                     if (_ipcClientStreamWriter != null)
-                                    {
-                                        var errPayload = new { Status = "Error", Message = "Failed to deserialize settings." };
-                                        var errResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateNack", Payload = errPayload };
-                                        await _ipcClientStreamWriter.WriteLineAsync(JsonConvert.SerializeObject(errResponseMessage).AsMemory(), cancellationToken);
-                                    }
+                                    _logger.LogWarning("IPC Server Instance {Instance}: Failed to deserialize LogMonitorSettings from UpdateSettings command payload.", instanceId);
+                                    var errPayload = new { Status = "Error", Message = "Failed to deserialize settings." };
+                                    var errResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateNack", Payload = errPayload };
+                                    await SendIpcResponseToInstanceAsync(localWriter, JsonConvert.SerializeObject(errResponseMessage), cancellationToken, instanceId);
                                 }
                             }
                             catch (Exception ex)
                             {
-                                _logger.LogError(ex, "IPC Server: Error processing UpdateSettings command.");
-                                if (_ipcClientStreamWriter != null)
-                                {
-                                    var errPayload = new { Status = "Error", Message = $"Error processing settings: {ex.Message}" };
-                                    var errResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateNack", Payload = errPayload };
-                                    await _ipcClientStreamWriter.WriteLineAsync(JsonConvert.SerializeObject(errResponseMessage).AsMemory(), cancellationToken);
-                                }
+                                _logger.LogError(ex, "IPC Server Instance {Instance}: Error processing UpdateSettings command.", instanceId);
+                                var errPayload = new { Status = "Error", Message = $"Error processing settings: {ex.Message}" };
+                                var errResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateNack", Payload = errPayload };
+                                await SendIpcResponseToInstanceAsync(localWriter, JsonConvert.SerializeObject(errResponseMessage), cancellationToken, instanceId);
                             }
                         }
                         else
                         {
-                             _logger.LogWarning("IPC Server: 'UpdateSettings' command received with null payload.");
-                             if (_ipcClientStreamWriter != null)
-                             {
-                                var errPayload = new { Status = "Error", Message = "UpdateSettings payload was null." };
-                                var errResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateNack", Payload = errPayload };
-                                await _ipcClientStreamWriter.WriteLineAsync(JsonConvert.SerializeObject(errResponseMessage).AsMemory(), cancellationToken);
-                             }
+                             _logger.LogWarning("IPC Server Instance {Instance}: 'UpdateSettings' command received with null payload.", instanceId);
+                            var errPayload = new { Status = "Error", Message = "UpdateSettings payload was null." };
+                            var errResponseMessage = new IpcMessage<object> { Type = "SettingsUpdateNack", Payload = errPayload };
+                            await SendIpcResponseToInstanceAsync(localWriter, JsonConvert.SerializeObject(errResponseMessage), cancellationToken, instanceId);
                         }
                         break;
                     
                     default:
-                        _logger.LogWarning("IPC Server: Unknown or unhandled command type received: {MessageType} from message: {RawMessage}", baseMessage.Type, messageJson);
+                        _logger.LogWarning("IPC Server Instance {Instance}: Unknown or unhandled command type received: {MessageType} from message: {RawMessage}", instanceId, baseMessage.Type, messageJson);
                         break;
                 }
             }
             catch (JsonException jsonEx)
             {
-                _logger.LogError(jsonEx, "IPC Server: JSON deserialization error in ProcessIpcMessageAsync for message: {MessageJson}", messageJson);
+                _logger.LogError(jsonEx, "IPC Server Instance {Instance}: JSON deserialization error in ProcessIpcMessageAsync for message: {MessageJson}", instanceId, messageJson);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "IPC Server: Error processing IPC message: {MessageJson}", messageJson);
+                _logger.LogError(ex, "IPC Server Instance {Instance}: Error processing IPC message: {MessageJson}", instanceId, messageJson);
             }
         }
 
         private async Task SendCurrentStatusToIpcClientAsync(CancellationToken cancellationToken = default)
         {
-            if (_ipcClientStreamWriter == null)
-            {
-                _logger.LogTrace("SendCurrentStatusToIpcClientAsync: No IPC client connected, cannot send status.");
-                return;
-            }
-
-            // Use the shared PipeServiceStatus model from Log2Postgres.Core.Services
-            var statusPayload = new PipeServiceStatus
-            {
-                ServiceOperationalState = GetOperationalStateString(),
-                IsProcessing = this.IsProcessing,
-                CurrentFile = this.CurrentFile,
-                CurrentPosition = this.CurrentPosition,
-                TotalLinesProcessedSinceStart = this.TotalLinesProcessed,
-                LastErrorMessage = _lastProcessingError ?? string.Empty
-            };
-
-            var message = new IpcMessage<PipeServiceStatus> { Type = IpcMessageTypes.StatusUpdate, Payload = statusPayload };
-            string jsonMessage = JsonConvert.SerializeObject(message);
-
             try
             {
+                // Use the shared PipeServiceStatus model from Log2Postgres.Core.Services
+                var statusPayload = new PipeServiceStatus
+                {
+                    ServiceOperationalState = GetOperationalStateString(),
+                    IsProcessing = this.IsProcessing,
+                    CurrentFile = this.CurrentFile,
+                    CurrentPosition = this.CurrentPosition,
+                    TotalLinesProcessedSinceStart = this.TotalLinesProcessed,
+                    LastErrorMessage = _lastProcessingError ?? string.Empty
+                };
+
+                var message = new IpcMessage<PipeServiceStatus> { Type = IpcMessageTypes.StatusUpdate, Payload = statusPayload };
+                string jsonMessage = JsonConvert.SerializeObject(message);
+
                 _logger.LogDebug("IPC Server: Proactively sending '{StatusUpdateType}' to client: {JsonMessage}", IpcMessageTypes.StatusUpdate, jsonMessage);
-                await _ipcClientStreamWriter.WriteLineAsync(jsonMessage.AsMemory(), cancellationToken).ConfigureAwait(false);
+                await SendIpcResponseSafelyAsync(jsonMessage, cancellationToken);
+            }
+            catch (InvalidOperationException)
+            {
+                _logger.LogTrace("SendCurrentStatusToIpcClientAsync: No IPC client connected, cannot send status.");
             }
             catch (IOException ioEx)
             {
                 _logger.LogWarning(ioEx, "IPC Server: IOException proactively sending status update. Client may have disconnected.");
-                // Consider nulling out _ipcClientStreamWriter or other cleanup if pipe is broken.
+                throw; // Let the server restart
             }
             catch (OperationCanceledException)
             {
@@ -924,6 +1164,7 @@ namespace Log2Postgres.Core.Services
             catch (Exception ex)
             {
                 _logger.LogError(ex, "IPC Server: Error proactively sending status update.");
+                throw; // Let the server restart
             }
         }
 

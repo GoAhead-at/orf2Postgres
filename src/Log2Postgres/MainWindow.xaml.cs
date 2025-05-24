@@ -88,7 +88,14 @@ public partial class MainWindow : Window, IAsyncDisposable
     private bool _hasUnsavedChanges = false;
     private System.Threading.Timer? _positionUpdateTimer;
     private DispatcherTimer? _serviceStatusTimer; // Restored declaration
-    private bool _isServiceInstalledCached = false; // Added to cache service installation state
+    private bool _isServiceInstalledCached = false; // Added to cache service installation status
+    
+    // Add cached status fields to handle IPC disconnections better
+    private PipeServiceStatus? _lastKnownServiceStatus = null;
+    private DateTime _lastStatusUpdateTime = DateTime.MinValue;
+    private bool _hasReceivedStatusSinceRestart = false;
+    private int _ipcReconnectionAttempts = 0;
+    private const int MaxIpcReconnectionAttempts = 10;
 
 #pragma warning disable CS8618
     public string ServiceOperationalState { get; set; } = string.Empty;
@@ -170,7 +177,12 @@ public partial class MainWindow : Window, IAsyncDisposable
     private Task OnIpcPipeDisconnected()
     {
         _logger.LogInformation("IPC Pipe Disconnected (event from IpcService).");
-        Dispatcher.Invoke(() => UpdateServiceControlUi());
+        Dispatcher.Invoke(() => 
+        {
+            // Reset reconnection attempts when pipe disconnects to start fresh reconnection cycle
+            _ipcReconnectionAttempts = 0;
+            UpdateServiceControlUi();
+        });
         return Task.CompletedTask;
     }
 
@@ -181,6 +193,12 @@ public partial class MainWindow : Window, IAsyncDisposable
 
         Dispatcher.Invoke(() =>
         {
+            // Cache the received status and reset reconnection attempts on successful IPC communication
+            _lastKnownServiceStatus = status;
+            _lastStatusUpdateTime = DateTime.Now;
+            _hasReceivedStatusSinceRestart = true;
+            _ipcReconnectionAttempts = 0;
+            
             // We have IPC status, so service is available via IPC.
             // We still need SC status for install/start/stop buttons.
             bool isServiceInstalled = false;
@@ -241,19 +259,38 @@ public partial class MainWindow : Window, IAsyncDisposable
 
             if (allowIpcConnectionAttempt && !_ipcService.IsConnected)
             {
-                _logger.LogDebug("ServiceStatusTimer: IPC not connected, attempting to connect.");
-                try
+                // Implement exponential backoff for IPC reconnection attempts
+                if (_ipcReconnectionAttempts < MaxIpcReconnectionAttempts)
                 {
-                    await _ipcService.ConnectAsync();
-                    if (_ipcService.IsConnected)
+                    int delayMs = Math.Min(1000 * (int)Math.Pow(2, _ipcReconnectionAttempts / 3), 5000);
+                    if (_ipcReconnectionAttempts > 0)
                     {
-                        await _ipcService.SendServiceStatusRequestAsync();
+                        _logger.LogDebug("ServiceStatusTimer: IPC not connected, waiting {DelayMs}ms before attempt {Attempt}", delayMs, _ipcReconnectionAttempts + 1);
+                        await Task.Delay(delayMs);
+                    }
+                    
+                    _logger.LogDebug("ServiceStatusTimer: IPC not connected, attempting to connect (attempt {Attempt}/{Max}).", _ipcReconnectionAttempts + 1, MaxIpcReconnectionAttempts);
+                    _ipcReconnectionAttempts++;
+                    
+                    try
+                    {
+                        await _ipcService.ConnectAsync();
+                        if (_ipcService.IsConnected)
+                        {
+                            _logger.LogInformation("ServiceStatusTimer: IPC reconnected successfully after {Attempts} attempts.", _ipcReconnectionAttempts);
+                            _ipcReconnectionAttempts = 0; // Reset on successful connection
+                            await _ipcService.SendServiceStatusRequestAsync();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "ServiceStatusTimer: Failed to connect to IPC service (attempt {Attempt}/{Max}).", _ipcReconnectionAttempts, MaxIpcReconnectionAttempts);
+                        // UI will be updated by UpdateServiceControlUi below
                     }
                 }
-                catch (Exception ex)
+                else
                 {
-                    _logger.LogWarning(ex, "ServiceStatusTimer: Failed to connect to IPC service.");
-                    // UI will be updated by UpdateServiceControlUi below
+                    _logger.LogTrace("ServiceStatusTimer: Max IPC reconnection attempts reached. Skipping further attempts until service restart.");
                 }
             }
             else if (_ipcService.IsConnected) // Only send status request if already connected
@@ -1219,6 +1256,13 @@ public partial class MainWindow : Window, IAsyncDisposable
         finally
         {
             StopPositionUpdateTimer();
+            
+            // Clear cached status when stopping local processing to avoid showing stale service status
+            _lastKnownServiceStatus = null;
+            _lastStatusUpdateTime = DateTime.MinValue;
+            _hasReceivedStatusSinceRestart = false;
+            _ipcReconnectionAttempts = 0;
+            
             // UpdateServiceControlUi will be called by StopBtn_Click which called this.
             // Ensure UI state reflects that processing is stopped for local mode.
             if (!_isProcessing)
@@ -1295,29 +1339,39 @@ public partial class MainWindow : Window, IAsyncDisposable
                 StopBtn.IsEnabled = (scStatus == ServiceControllerStatus.Running || scStatus == ServiceControllerStatus.StartPending || scStatus == ServiceControllerStatus.PausePending || scStatus == ServiceControllerStatus.ContinuePending);
             }
 
-            if (PipeStatusTextBlock != null)
-                 PipeStatusTextBlock.Text = pipeStatus?.ServiceOperationalState ?? (serviceAvailableViaIpc ? "Connected, awaiting status..." : "Service Not Responding");
-            
-            if (ProcessingStatusText != null)
-                ProcessingStatusText.Text = pipeStatus?.IsProcessing ?? false ? "Service: Processing Active" : "Service: Processing Inactive";
-
             if (serviceAvailableViaIpc && pipeStatus != null)
             {
+                // IPC is connected and we have a fresh status from the service
+                if (PipeStatusTextBlock != null) PipeStatusTextBlock.Text = pipeStatus.ServiceOperationalState;
+                if (ProcessingStatusText != null) ProcessingStatusText.Text = pipeStatus.IsProcessing ? "Service: Processing Active" : "Service: Processing Inactive";
                 if (CurrentFileText != null) CurrentFileText.Text = pipeStatus.CurrentFile;
                 if (CurrentPositionText != null) CurrentPositionText.Text = pipeStatus.CurrentPosition.ToString();
                 if (LinesProcessedText != null) LinesProcessedText.Text = pipeStatus.TotalLinesProcessedSinceStart.ToString();
                 if (PipeStatusIndicator != null) PipeStatusIndicator.Background = new SolidColorBrush(Colors.Green);
             }
+            else if (_lastKnownServiceStatus != null && 
+                     (DateTime.Now - _lastStatusUpdateTime).TotalMinutes < 5 && 
+                     (scStatus == ServiceControllerStatus.Running || scStatus == ServiceControllerStatus.StartPending))
+            {
+                // IPC is not connected but we have recent cached status (less than 5 minutes old)
+                // AND the service is actually running (only show cached status if service should be running)
+                var cachedStatus = _lastKnownServiceStatus;
+                if (PipeStatusTextBlock != null) PipeStatusTextBlock.Text = $"{cachedStatus.ServiceOperationalState} (Cached)";
+                if (ProcessingStatusText != null) ProcessingStatusText.Text = cachedStatus.IsProcessing ? "Service: Processing Active (Cached)" : "Service: Processing Inactive (Cached)";
+                if (CurrentFileText != null) CurrentFileText.Text = cachedStatus.CurrentFile;
+                if (CurrentPositionText != null) CurrentPositionText.Text = cachedStatus.CurrentPosition.ToString();
+                if (LinesProcessedText != null) LinesProcessedText.Text = cachedStatus.TotalLinesProcessedSinceStart.ToString();
+                if (PipeStatusIndicator != null) PipeStatusIndicator.Background = new SolidColorBrush(Colors.Orange); // Orange to indicate cached/stale data
+            }
             else
             {
+                // IPC is NOT connected and no recent cached status - fall back to ServiceController status
+                if (PipeStatusTextBlock != null) PipeStatusTextBlock.Text = $"Service: {scStatus.ToString()}";
+                if (ProcessingStatusText != null) ProcessingStatusText.Text = scStatus == ServiceControllerStatus.Running ? "Service: Status Unknown (IPC Down)" : "Service: Not Running";
                 if (CurrentFileText != null) CurrentFileText.Text = "N/A";
                 if (CurrentPositionText != null) CurrentPositionText.Text = "N/A";
                 if (LinesProcessedText != null) LinesProcessedText.Text = "N/A";
-                if (PipeStatusIndicator != null) PipeStatusIndicator.Background = new SolidColorBrush(Colors.Orange);
-                if (PipeStatusTextBlock != null && string.IsNullOrEmpty(pipeStatus?.ServiceOperationalState))
-                {
-                     PipeStatusTextBlock.Text = $"Service: {scStatus.ToString()}"; 
-                }
+                if (PipeStatusIndicator != null) PipeStatusIndicator.Background = new SolidColorBrush(Colors.Red); // Red to indicate no status available
             }
         }
         else // Service NOT installed - LOCAL PROCESSING MODE
@@ -1439,6 +1493,13 @@ public partial class MainWindow : Window, IAsyncDisposable
     private void UninstallServiceBtn_Click(object sender, RoutedEventArgs e)
     {
         _logger.LogInformation("Uninstall Service button clicked. Attempting to call App.UninstallService().");
+        
+        // Clear cached status when uninstalling service to avoid showing stale data
+        _lastKnownServiceStatus = null;
+        _lastStatusUpdateTime = DateTime.MinValue;
+        _hasReceivedStatusSinceRestart = false;
+        _ipcReconnectionAttempts = 0;
+        
         // The App.IsAdministrator() check and preliminary MessageBox are removed.
         // App.UninstallService() will handle elevation via UAC for sc.exe.
         App.UninstallService();
@@ -1473,12 +1534,18 @@ public partial class MainWindow : Window, IAsyncDisposable
                 }
             }
 
+            // Reset cached status when starting service to avoid showing stale data
+            _lastKnownServiceStatus = null;
+            _lastStatusUpdateTime = DateTime.MinValue;
+            _hasReceivedStatusSinceRestart = false;
+            _ipcReconnectionAttempts = 0;
+
             App.StartWindowsService(App.WindowsServiceName); // Use constant
             
             if (_ipcService != null && !_ipcService.IsConnected)
             {
-                _logger.LogInformation("Attempting to connect IPC after starting Windows service (with delay).");
-                await Task.Delay(1500); // Increased delay for service to start up its pipe server
+                _logger.LogInformation("Attempting to connect IPC after starting Windows service (with extended delay).");
+                await Task.Delay(3000); // Give the service more time to fully start IPC server
                 try
                 {
                     await _ipcService.ConnectAsync(); 
@@ -1489,7 +1556,7 @@ public partial class MainWindow : Window, IAsyncDisposable
                 }
                 catch(Exception ex)
                 {
-                    _logger.LogWarning(ex, "Failed to connect IPC after starting Windows service.");
+                    _logger.LogWarning(ex, "Failed to connect IPC after starting Windows service. ServiceStatusTimer will continue attempting to reconnect.");
                 }
             }
         }
@@ -1536,6 +1603,12 @@ public partial class MainWindow : Window, IAsyncDisposable
         {
             _logger.LogInformation("Stop Service button clicked (service is installed). Attempting to call App.StopWindowsService().");
             // The App.IsAdministrator() check is removed. App.StopWindowsService will handle elevation.
+            
+            // Reset cached status when stopping service
+            _lastKnownServiceStatus = null;
+            _lastStatusUpdateTime = DateTime.MinValue;
+            _hasReceivedStatusSinceRestart = false;
+            _ipcReconnectionAttempts = 0;
             
             App.StopWindowsService(App.WindowsServiceName); // Use constant
             //UpdateServiceControlUi(); // Refresh UI after attempting action // Potentially too soon

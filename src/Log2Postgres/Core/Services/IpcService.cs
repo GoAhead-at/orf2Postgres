@@ -108,13 +108,18 @@ namespace Log2Postgres.Core.Services
 
                 try
                 {
-                    lock (_lock)
+                    lock (_lock) // Ensure exclusive access for disposing and creating pipe resources
                     {
+                        // Dispose existing resources if this is a retry or a new attempt after a previous one
                         if (_pipeClient != null)
                         {
-                            _pipeReader?.Dispose();
-                            _pipeWriter?.Dispose();
-                            _pipeClient.Dispose();
+                            _logger.LogDebug("Disposing existing pipe resources before new connection attempt.");
+                            _pipeWriter?.Dispose(); // Dispose writer first
+                            _pipeReader?.Dispose(); // Then reader
+                            _pipeClient.Dispose();  // Then client stream
+                            _pipeWriter = null;
+                            _pipeReader = null;
+                            _pipeClient = null;
                         }
 
                         _pipeClient = new NamedPipeClientStream(".", _pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
@@ -124,18 +129,22 @@ namespace Log2Postgres.Core.Services
                     await _pipeClient.ConnectAsync(timeout, cancellationToken).ConfigureAwait(false);
                     _logger.LogInformation("Successfully connected to IPC pipe '{PipeName}'.", _pipeName);
 
-                    lock (_lock)
+                    // Initialize reader and writer immediately after successful connection, still under potential lock if needed by other parts
+                    // However, the critical part is that _pipeClient is valid here.
+                    // Adding a lock here to be consistent with _isConnected logic and StartListeningAsync
+                    lock(_lock)
                     {
-                        _pipeReader = new StreamReader(_pipeClient);
-                        _pipeWriter = new StreamWriter(_pipeClient) { AutoFlush = false }; 
+                        _pipeReader = new StreamReader(_pipeClient); 
+                        _pipeWriter = new StreamWriter(_pipeClient) { AutoFlush = false }; // AutoFlush false, we flush manually
+                        _isConnected = true; // Set connected only after streams are initialized
                     }
 
-                    _isConnected = true;
+                    _receiveCts?.Dispose(); // Dispose previous CTS if any
                     _receiveCts = new CancellationTokenSource();
                     _receiveTask = StartListeningAsync(_receiveCts.Token);
 
                     _logger.LogInformation("IPC client connected and listener started.");
-                    if (PipeConnected != null) // Check for null before invoking
+                    if (PipeConnected != null)
                     {
                         await PipeConnected.Invoke().ConfigureAwait(false);
                     }
@@ -354,13 +363,14 @@ namespace Log2Postgres.Core.Services
 
         private async Task DisconnectAsyncInternal()
         {
-            if (!_isConnected && _pipeClient == null) 
+            if (!_isConnected && _pipeClient == null && _receiveTask == null) 
             {
-                _logger.LogDebug("DisconnectAsyncInternal called but already disconnected or never connected.");
+                _logger.LogDebug("DisconnectAsyncInternal called but already effectively disconnected or never connected.");
                 return;
             }
 
             _logger.LogInformation("DisconnectAsyncInternal: Initiating disconnection from IPC pipe.");
+            bool wasConnected = _isConnected; // Capture state for event firing
             _isConnected = false; 
 
             if (_receiveCts != null)
@@ -394,7 +404,25 @@ namespace Log2Postgres.Core.Services
                 if (_pipeWriter != null)
                 {
                     _logger.LogDebug("Disposing StreamWriter.");
-                    try { _pipeWriter.Dispose(); } catch (Exception ex) { _logger.LogWarning(ex, "Exception disposing StreamWriter."); }
+                    try 
+                    {
+                        // If the pipe was connected, attempt to flush. Otherwise, just dispose.
+                        // However, StreamWriter.Dispose() should call Flush.
+                        // The InvalidOperationException "Pipe hasn't been connected yet" might occur if
+                        // _pipeClient.IsConnected is false when Dispose() tries to Flush.
+                        // Let's rely on the standard Dispose behavior for now.
+                        _pipeWriter.Dispose(); 
+                    } 
+                    catch (ObjectDisposedException odEx)
+                    {
+                         _logger.LogWarning(odEx, "ObjectDisposedException during StreamWriter.Dispose(). Likely already disposed.");
+                    }
+                    catch (InvalidOperationException ioEx)
+                    {
+                        _logger.LogWarning(ioEx, "InvalidOperationException during StreamWriter.Dispose(). Pipe might not have been connected or already closed.");
+                    }
+                    catch (Exception ex) 
+                    { _logger.LogWarning(ex, "Exception disposing StreamWriter."); }
                     _pipeWriter = null;
                 }
 
@@ -423,7 +451,7 @@ namespace Log2Postgres.Core.Services
             _logger.LogInformation("IPC client disconnected.");
             try
             {
-                if (PipeDisconnected != null) // Check for null before invoking
+                if (wasConnected && PipeDisconnected != null) // Fire event only if it was previously connected
                 {
                     await PipeDisconnected.Invoke().ConfigureAwait(false);
                 }
