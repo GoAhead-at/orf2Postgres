@@ -864,10 +864,13 @@ namespace Log2Postgres.Core.Services
                     try
                     {
                         await SendCurrentStatusToIpcClientAsync(cancellationToken);
+                        
+                        // Flush any buffered log entries from before the client connected
+                        await FlushBufferedLogEntriesAsync(localWriter);
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex, "IPC Server Instance {Instance}: Failed to send initial status.", instanceId);
+                        _logger.LogWarning(ex, "IPC Server Instance {Instance}: Failed to send initial status or flush buffered entries.", instanceId);
                     }
                 }
 
@@ -1362,7 +1365,7 @@ namespace Log2Postgres.Core.Services
             {
                 try
                 {
-                    var ipcMessage = new IpcMessage<List<string>> { Type = "LOG_ENTRIES", Payload = entriesToFlush };
+                    var ipcMessage = new IpcMessage<List<string>> { Type = IpcMessageTypes.LogEntry, Payload = entriesToFlush };
                     string jsonMessage = JsonConvert.SerializeObject(ipcMessage);
                     _logger.LogDebug("IPC FlushBuffered: Attempting to send JSON for {Count} entries: {JsonMessage}", entriesToFlush.Count, jsonMessage);
                     await writer.WriteLineAsync(jsonMessage.AsMemory(), _stoppingCts.Token);
