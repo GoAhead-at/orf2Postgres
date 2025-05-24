@@ -81,7 +81,7 @@ namespace Log2Postgres.Core.Services
 
                     if (process.ExitCode == 0 && (sc.Status == ServiceControllerStatus.Running || sc.Status == ServiceControllerStatus.StartPending))
                     {
-                        System.Windows.MessageBox.Show("Service started successfully (or is starting).", "Service Control", MessageBoxButton.OK, MessageBoxImage.Information);
+                        Console.WriteLine("Service started successfully (or is starting).");
                     }
                     else if (process.ExitCode != 0)
                     {
@@ -139,7 +139,7 @@ namespace Log2Postgres.Core.Services
 
                     if (process.ExitCode == 0 && (sc.Status == ServiceControllerStatus.Stopped || sc.Status == ServiceControllerStatus.StopPending))
                     {
-                        System.Windows.MessageBox.Show("Service stopped successfully (or is stopping).", "Service Control", MessageBoxButton.OK, MessageBoxImage.Information);
+                        Console.WriteLine("Service stopped successfully (or is stopping).");
                     }
                     else if (process.ExitCode != 0)
                     {
@@ -227,7 +227,7 @@ namespace Log2Postgres.Core.Services
 
                     if (process.ExitCode == 0)
                     {
-                        System.Windows.MessageBox.Show("Service installed successfully. You may need to refresh the UI or restart the app to see the status change.", "Service Installation", MessageBoxButton.OK, MessageBoxImage.Information);
+                        Console.WriteLine("Service installed successfully.");
                     }
                     else
                     {
@@ -298,12 +298,12 @@ namespace Log2Postgres.Core.Services
 
                     if (process.ExitCode == 0)
                     {
-                        System.Windows.MessageBox.Show("Service uninstalled successfully. You may need to refresh the UI or restart the app to see the status change.", "Service Uninstallation", MessageBoxButton.OK, MessageBoxImage.Information);
+                        Console.WriteLine("Service uninstalled successfully.");
                     }
                     // 1060: The specified service does not exist as an installed service.
                     else if (process.ExitCode == 1060) // This might not be reliably returned if runas fails earlier.
                     {
-                        System.Windows.MessageBox.Show("Service was not installed or already uninstalled.", "Service Uninstallation", MessageBoxButton.OK, MessageBoxImage.Information);
+                        Console.WriteLine("Service was not installed or already uninstalled.");
                     }
                     else
                     {

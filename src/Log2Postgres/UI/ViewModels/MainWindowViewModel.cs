@@ -444,11 +444,24 @@ namespace Log2Postgres.UI.ViewModels
         {
             try
             {
+                AddLogEntry("⏳ Installing service...");
                 await _serviceManager.InstallServiceAsync();
-                AddLogEntry("✓ Service installation initiated");
                 
                 // Refresh service status to update UI state
                 await _serviceManager.RefreshServiceStatusAsync();
+                
+                // Explicitly refresh command states to update button visibility immediately
+                CommandManager.InvalidateRequerySuggested();
+                
+                // Check if installation was successful
+                if (IsServiceInstalled)
+                {
+                    AddLogEntry("✓ Service installed successfully");
+                }
+                else
+                {
+                    AddLogEntry("⚠ Service installation status unclear - please check manually");
+                }
             }
             catch (Exception ex)
             {
@@ -461,11 +474,24 @@ namespace Log2Postgres.UI.ViewModels
         {
             try
             {
+                AddLogEntry("⏳ Uninstalling service...");
                 await _serviceManager.UninstallServiceAsync();
-                AddLogEntry("✓ Service uninstallation initiated");
                 
                 // Refresh service status to update UI state
                 await _serviceManager.RefreshServiceStatusAsync();
+                
+                // Explicitly refresh command states to update button visibility immediately
+                CommandManager.InvalidateRequerySuggested();
+                
+                // Check if uninstallation was successful
+                if (!IsServiceInstalled)
+                {
+                    AddLogEntry("✓ Service uninstalled successfully");
+                }
+                else
+                {
+                    AddLogEntry("⚠ Service uninstallation status unclear - please check manually");
+                }
             }
             catch (Exception ex)
             {
@@ -478,11 +504,21 @@ namespace Log2Postgres.UI.ViewModels
         {
             try
             {
+                AddLogEntry("⏳ Starting service...");
                 await _serviceManager.StartServiceAsync();
-                AddLogEntry("✓ Service start initiated");
                 
                 // Refresh service status to update UI state
                 await _serviceManager.RefreshServiceStatusAsync();
+                
+                // Check if service started successfully
+                if (ServiceStatus == ServiceControllerStatus.Running || ServiceStatus == ServiceControllerStatus.StartPending)
+                {
+                    AddLogEntry("✓ Service started successfully");
+                }
+                else
+                {
+                    AddLogEntry("⚠ Service start status unclear - please check manually");
+                }
             }
             catch (Exception ex)
             {
@@ -495,11 +531,21 @@ namespace Log2Postgres.UI.ViewModels
         {
             try
             {
+                AddLogEntry("⏳ Stopping service...");
                 await _serviceManager.StopServiceAsync();
-                AddLogEntry("✓ Service stop initiated");
                 
                 // Refresh service status to update UI state
                 await _serviceManager.RefreshServiceStatusAsync();
+                
+                // Check if service stopped successfully
+                if (ServiceStatus == ServiceControllerStatus.Stopped || ServiceStatus == ServiceControllerStatus.StopPending)
+                {
+                    AddLogEntry("✓ Service stopped successfully");
+                }
+                else
+                {
+                    AddLogEntry("⚠ Service stop status unclear - please check manually");
+                }
             }
             catch (Exception ex)
             {
@@ -520,6 +566,9 @@ namespace Log2Postgres.UI.ViewModels
                 await _logFileWatcher.UIManagedStartProcessingAsync();
                 IsProcessing = true;
                 AddLogEntry("✓ Local processing started");
+                
+                // Trigger command CanExecute refresh to update button states
+                CommandManager.InvalidateRequerySuggested();
             }
             catch (Exception ex)
             {
@@ -536,6 +585,9 @@ namespace Log2Postgres.UI.ViewModels
                 _logFileWatcher.UIManagedStopProcessing();
                 IsProcessing = false;
                 AddLogEntry("✓ Local processing stopped");
+                
+                // Trigger command CanExecute refresh to update button states
+                CommandManager.InvalidateRequerySuggested();
             }
             catch (Exception ex)
             {
@@ -576,13 +628,11 @@ namespace Log2Postgres.UI.ViewModels
 
         private bool CanStartLocalProcessing()
         {
-            // Can start local processing if:
+            // Can start local processing ONLY if:
             // 1. Not currently processing locally
-            // 2. Service is not installed or not running (to avoid conflicts)
-            return !IsProcessing && 
-                   (!IsServiceInstalled || 
-                    ServiceStatus == ServiceControllerStatus.Stopped ||
-                    !IsIpcConnected);
+            // 2. Service is NOT installed (local mode only)
+            // When service is installed, all processing should go through service commands
+            return !IsProcessing && !IsServiceInstalled;
         }
 
         private bool CanStopLocalProcessing()
@@ -792,13 +842,12 @@ namespace Log2Postgres.UI.ViewModels
             CurrentPosition = status.CurrentPosition;
             
             // Only update TotalLinesProcessed from IPC if we're not doing local processing
-            // Local processing maintains its own accumulated count
-            if (!IsProcessing || IsIpcConnected)
+            // Local processing maintains its own state and accumulated count
+            // NOTE: IsProcessing should NEVER be set from IPC - it only represents LOCAL processing state
+            if (!IsProcessing)
             {
                 TotalLinesProcessed = status.TotalLinesProcessedSinceStart;
             }
-            
-            IsProcessing = status.IsProcessing;
         }
 
         private Task OnLogEntriesReceived(System.Collections.Generic.List<string> logEntries)
@@ -958,11 +1007,13 @@ namespace Log2Postgres.UI.ViewModels
                 try
                 {
                     _isExecuting = true;
+                    CommandManager.InvalidateRequerySuggested(); // Refresh UI when execution starts
                     await _execute();
                 }
                 finally
                 {
                     _isExecuting = false;
+                    CommandManager.InvalidateRequerySuggested(); // Refresh UI when execution completes
                 }
             }
         }

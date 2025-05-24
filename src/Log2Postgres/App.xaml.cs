@@ -440,7 +440,6 @@ namespace Log2Postgres
                     if (process.ExitCode == 0)
                     {
                         Console.WriteLine("Service installed successfully.");
-                        System.Windows.MessageBox.Show("Service installed successfully.", "Service Installation", MessageBoxButton.OK, MessageBoxImage.Information);
                     }
                     else
                     {
@@ -460,57 +459,32 @@ namespace Log2Postgres
         {
             string serviceName = WindowsServiceName;
 
-            string stopCommand = $"stop {serviceName}";
-            Console.WriteLine($"Attempting to stop service with command: sc.exe {stopCommand}");
+            // Use a single elevated cmd.exe process to run both stop and delete commands
+            // This reduces UAC prompts from 2 to 1, matching the install experience
+            string batchCommands = $"sc.exe stop {serviceName} & sc.exe delete {serviceName}";
+            
+            Console.WriteLine($"Attempting to stop and uninstall service with combined command: cmd.exe /c \"{batchCommands}\"");
             try
             {
                 using (Process process = new Process())
                 {
-                    process.StartInfo.FileName = "sc.exe";
-                    process.StartInfo.Arguments = stopCommand;
+                    process.StartInfo.FileName = "cmd.exe";
+                    process.StartInfo.Arguments = $"/c \"{batchCommands}\"";
                     process.StartInfo.UseShellExecute = true;
-                    process.StartInfo.Verb = "runas";
-                    process.StartInfo.CreateNoWindow = true;
-                    process.Start();
-                    process.WaitForExit();
-
-                    if (process.ExitCode == 0 || process.ExitCode == 1062 || process.ExitCode == 1060)
-                    {
-                        Console.WriteLine("Service stop command executed (or service was not running/not found).");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"Service stop command failed. Exit code: {process.ExitCode}");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Exception during service stop attempt: {ex.Message}");
-            }
-
-            string deleteCommand = $"delete {serviceName}";
-            Console.WriteLine($"Attempting to uninstall service with command: sc.exe {deleteCommand}");
-            try
-            {
-                using (Process process = new Process())
-                {
-                    process.StartInfo.FileName = "sc.exe";
-                    process.StartInfo.Arguments = deleteCommand;
-                    process.StartInfo.UseShellExecute = true;
-                    process.StartInfo.Verb = "runas";
+                    process.StartInfo.Verb = "runas"; // Single UAC prompt for both operations
                     process.StartInfo.CreateNoWindow = true;
                     process.Start();
                     process.WaitForExit();
 
                     if (process.ExitCode == 0)
                     {
-                        Console.WriteLine("Service uninstalled successfully.");
-                        System.Windows.MessageBox.Show("Service uninstalled successfully.", "Service Uninstallation", MessageBoxButton.OK, MessageBoxImage.Information);
+                        Console.WriteLine("Service stopped and uninstalled successfully.");
                     }
                     else
                     {
-                        Console.WriteLine($"Service uninstallation failed. Exit code: {process.ExitCode}");
+                        Console.WriteLine($"Service uninstallation process failed. Exit code: {process.ExitCode}");
+                        // Note: Even if stop fails (service already stopped), delete might succeed
+                        // The batch command continues with & operator regardless of first command result
                         System.Windows.MessageBox.Show($"Service uninstallation failed. Exit code: {process.ExitCode}", "Uninstallation Error", MessageBoxButton.OK, MessageBoxImage.Error);
                     }
                 }
