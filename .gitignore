@@ -81,6 +81,7 @@ logs/
 # IDE / Editor specific folders
 .cursor/
 .idea/
+.NET.mdc
 
 # DOCS files to ignore
 DOCS/history_rule_update.md
