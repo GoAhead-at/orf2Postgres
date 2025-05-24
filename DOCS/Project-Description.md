@@ -295,13 +295,32 @@ The UI and service communicate using Named Pipes with enhanced security and reli
 - **Validation**: Comprehensive configuration validation and error reporting
 
 ### **Deployment Strategy**
-- **Single-File Publishing**:
+
+- **Framework-Dependent Single-File (Recommended)**:
   ```bash
-  dotnet publish -c Release -r win-x64 /p:PublishSingleFile=true /p:SelfContained=true /p:IncludeNativeLibrariesForSelfExtract=true /p:PublishReadyToRun=true
+  # Creates ~14MB executable requiring .NET 8 runtime on target machine
+  dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true -p:SelfContained=false
   ```
-- **Framework-Dependent Option**: Smaller deployment requiring .NET 8 runtime
-- **Self-Contained Option**: Full deployment with embedded runtime
-- **ReadyToRun**: Pre-compiled for faster startup performance
+  - **Pros**: Small file size (~14MB), faster build times
+  - **Cons**: Requires .NET 8 runtime installation on target machine
+  - **Use Case**: Most production deployments where .NET runtime can be installed
+
+- **Self-Contained Single-File**:
+  ```bash
+  # Creates ~150MB executable with embedded .NET runtime  
+  dotnet publish -c Release -r win-x64 -p:PublishSingleFile=true -p:SelfContained=true -p:IncludeNativeLibrariesForSelfExtract=true -p:PublishReadyToRun=true
+  ```
+  - **Pros**: No runtime dependencies, runs on any compatible Windows machine
+  - **Cons**: Large file size (~150MB), longer build times
+  - **Use Case**: Environments where .NET runtime cannot be installed
+
+- **Output Locations**:
+  - Framework-dependent: `bin\Release\net8.0-windows\win-x64\publish\Log2Postgres.exe`
+  - Self-contained: `release\Log2Postgres_win-x64_singlefile\Log2Postgres.exe`
+
+- **Runtime Requirements**:
+  - Framework-dependent: .NET 8 Desktop Runtime (download from https://dotnet.microsoft.com/download/dotnet/8.0/runtime)
+  - Self-contained: None (runtime embedded in executable)
 
 ---
 
