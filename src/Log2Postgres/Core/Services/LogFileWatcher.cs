@@ -492,6 +492,9 @@ namespace Log2Postgres.Core.Services
                     _logger.LogDebug("Notifying UI of processing status update (pre-DB save)");
                     ProcessingStatusChanged?.Invoke(CurrentFile, entries.Count, newPosition); 
                     EntriesProcessed?.Invoke(entries); 
+                    
+                    // Send a processing status message to IPC before sending the entries
+                    await SendProcessingStatusMessageToIpcAsync(Path.GetFileName(filePath), entries.Count, TotalLinesProcessed);
                     await SendLogEntriesToIpcClientAsync(entries);
 
                     try
@@ -1170,10 +1173,31 @@ namespace Log2Postgres.Core.Services
 
         private async Task SendLogEntriesToIpcClientAsync(IEnumerable<OrfLogEntry> entries)
         {
-            var logMessages = entries.Select(e => e.EventMsg ?? string.Empty).Where(s => !string.IsNullOrEmpty(s)).ToList();
+            // Format log entries to match the local mode display
+            var logMessages = new List<string>();
+            
+            if (entries.Any())
+            {
+                // Add batch header message similar to local mode
+                var firstEntry = entries.First();
+                logMessages.Add($"--- Batch of {entries.Count()} Processed Entries from {firstEntry.SourceFilename} ---");
+                
+                // Add individual entry details
+                foreach (var entry in entries)
+                {
+                    string entryDetails = entry.IsSystemMessage ?
+                        $"Sys Msg: {entry.MessageId}, {entry.EventClass}, {entry.EventAction}, {entry.EventMsg}" :
+                        $"Entry: {entry.MessageId}, {entry.EventDateTime}, {entry.EventClass}, {entry.EventAction}, {entry.Sender}, '{entry.MsgSubject}'";
+                    logMessages.Add(entryDetails);
+                }
+                
+                // Add batch footer
+                logMessages.Add("--- End Batch ---");
+            }
+            
             if (!logMessages.Any())
             {
-                _logger.LogDebug("IPC SendLogEntries: No valid log messages to send after filtering.");
+                _logger.LogDebug("IPC SendLogEntries: No valid log messages to send after formatting.");
                 return;
             }
 
@@ -1234,7 +1258,7 @@ namespace Log2Postgres.Core.Services
                     return;
                 }
 
-                var ipcMessage = new IpcMessage<List<string>> { Type = "LOG_ENTRIES", Payload = messagesToSend };
+                var ipcMessage = new IpcMessage<List<string>> { Type = IpcMessageTypes.LogEntry, Payload = messagesToSend };
                 string jsonMessage = JsonConvert.SerializeObject(ipcMessage);
                 _logger.LogDebug("IPC SendLogEntries: Attempting to send JSON for {Count} total entries: {JsonMessage}", messagesToSend.Count, jsonMessage);
                 
@@ -1264,6 +1288,48 @@ namespace Log2Postgres.Core.Services
             { 
                 _logger.LogError(ex, "IPC SendLogEntries: Error sending log entries. Re-buffering. Writer state unchanged unless it was the cause."); 
                 lock (_ipcClientWriterLock) { _bufferedLogEntries.InsertRange(0, messagesToSend); }
+            }
+        }
+
+        private async Task SendProcessingStatusMessageToIpcAsync(string fileName, int entriesCount, int totalLinesProcessed)
+        {
+            var statusMessages = new List<string>
+            {
+                $"Processed {entriesCount} entries from {fileName} (Total: {totalLinesProcessed})"
+            };
+
+            StreamWriter? writer;
+            lock (_ipcClientWriterLock)
+            {
+                writer = _ipcClientStreamWriter;
+                if (writer == null)
+                {
+                    _logger.LogDebug("IPC SendProcessingStatus: No client connected, buffering status message.");
+                    _bufferedLogEntries.AddRange(statusMessages);
+                    return;
+                }
+            }
+
+            try
+            {
+                var ipcMessage = new IpcMessage<List<string>> { Type = IpcMessageTypes.LogEntry, Payload = statusMessages };
+                string jsonMessage = JsonConvert.SerializeObject(ipcMessage);
+                await writer.WriteLineAsync(jsonMessage.AsMemory(), _stoppingCts.Token);
+                _logger.LogDebug("IPC: Sent processing status message to client.");
+            }
+            catch (IOException ioEx)
+            {
+                _logger.LogWarning(ioEx, "IPC SendProcessingStatus: IOException sending status. Re-buffering.");
+                lock (_ipcClientWriterLock) 
+                { 
+                    if (_ipcClientStreamWriter == writer) _ipcClientStreamWriter = null;
+                    _bufferedLogEntries.AddRange(statusMessages);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "IPC SendProcessingStatus: Error sending status. Re-buffering.");
+                lock (_ipcClientWriterLock) { _bufferedLogEntries.AddRange(statusMessages); }
             }
         }
 

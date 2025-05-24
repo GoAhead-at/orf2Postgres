@@ -237,8 +237,9 @@
                             </StackPanel>
                             
                             <!-- Log Text Box -->
-                            <TextBox x:Name="LogTextBox" Grid.Row="1" IsReadOnly="True" TextWrapping="Wrap" 
-                                     VerticalScrollBarVisibility="Auto" FontFamily="Consolas"/>
+                            <TextBox x:Name="LogTextBox" Grid.Row="1" IsReadOnly="True" TextWrapping="NoWrap" 
+                                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" 
+                                     FontFamily="Consolas"/>
                         </Grid>
                     </GroupBox>
                     
