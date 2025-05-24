@@ -342,6 +342,10 @@ namespace Log2Postgres
                 services.AddSingleton<UI.Services.IAppConfigurationManager, UI.Services.AppConfigurationManager>();
                 services.AddTransient<UI.ViewModels.MainWindowViewModel>();
                 services.AddTransient<MainWindow>();
+                
+                // Register infrastructure services
+                services.AddSingleton<Infrastructure.Resilience.IResilienceService, Infrastructure.Resilience.ResilienceService>();
+                services.AddSingleton<Infrastructure.Resources.IResourceManager, Infrastructure.Resources.ResourceManager>();
             });
 
             return hostBuilder;
