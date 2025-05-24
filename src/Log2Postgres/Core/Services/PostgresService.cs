@@ -23,7 +23,7 @@ namespace Log2Postgres.Core.Services
             _logger = logger;
             _settingsMonitor = settingsMonitor;
             
-            _logger.LogWarning("DEBUG PURPOSE ONLY - PostgresService constructor (IOptionsMonitor) received initial password: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", _settingsMonitor.CurrentValue.Password);
+            _logger.LogDebug("PostgresService constructor initialized with IOptionsMonitor");
         }
 
         /// <summary>
@@ -39,9 +39,6 @@ namespace Log2Postgres.Core.Services
                 currentSettings.Database,
                 string.IsNullOrEmpty(currentSettings.Password),
                 currentSettings.ConnectionTimeout);
-            
-            // DEBUG ONLY - Log the password in cleartext - REMOVE IN PRODUCTION
-            _logger.LogWarning("DEBUG PURPOSE ONLY - Password being used for current connection string: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", currentSettings.Password);
                 
             var builder = new NpgsqlConnectionStringBuilder
             {
@@ -69,9 +66,6 @@ namespace Log2Postgres.Core.Services
                 _logger.LogDebug("Connection details - Database: {Database}, Username: {Username}, Timeout: {Timeout}s", 
                     currentSettings.Database, currentSettings.Username, currentSettings.ConnectionTimeout);
                 
-                // DEBUG ONLY - Log the password in cleartext - REMOVE IN PRODUCTION
-                _logger.LogWarning("DEBUG PURPOSE ONLY - Password being used for connection test: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", currentSettings.Password);
-                
                 using var connection = new NpgsqlConnection(connectionString);
                 _logger.LogDebug("Opening database connection...");
                 await connection.OpenAsync();
@@ -89,8 +83,7 @@ namespace Log2Postgres.Core.Services
                     if (pgEx.SqlState == "28P01") // Authentication error
                     {
                         errorMessage = "Authentication failed. Check your username and password.";
-                        // DEBUG ONLY - Log the password in cleartext - REMOVE IN PRODUCTION
-                        _logger.LogWarning("DEBUG PURPOSE ONLY - Failed authentication with password: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", currentSettings.Password);
+                        _logger.LogDebug("Authentication failed - check username and password configuration");
                     }
                     else if (pgEx.SqlState == "3D000") // Database does not exist
                     {
@@ -610,7 +603,6 @@ namespace Log2Postgres.Core.Services
 
             _logger.LogDebug("Using settings - host: {Host}, port: {Port}, db: {Db}, user: {User}. ConnString built.", 
                 currentSettings.Host, currentSettings.Port, currentSettings.Database, currentSettings.Username);
-            _logger.LogWarning("DEBUG PURPOSE ONLY - Password for this operation: '{Password}' [SECURITY RISK - REMOVE THIS LOG]", currentSettings.Password);
 
             return (currentSettings, connectionString);
         }

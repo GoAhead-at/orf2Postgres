@@ -100,6 +100,6 @@ namespace Log2Postgres.Core.Models
         /// <summary>
         /// Determines if the log entry is a system message
         /// </summary>
-        public bool IsSystemMessage => MessageId == "0-0";
+        public bool IsSystemMessage => MessageId == "0-0" || MessageId.StartsWith("SYS-");
     }
 } 

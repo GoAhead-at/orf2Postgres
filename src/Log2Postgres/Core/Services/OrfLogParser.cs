@@ -140,22 +140,17 @@ namespace Log2Postgres.Core.Services
                 // Handle the special case for system messages (0-0)
                 if (parts.Length > 0 && parts[0] == "0-0")
                 {
-                    // System message format is different (0-0 - dateTime System Info - ...)
-                    entry.MessageId = parts[0];
-                    entry.EventSource = parts[1]; // Usually "-"
-                    
-                    // Parse datetime from a system message (third component)
+                    // Parse datetime first to use in synthetic ID generation
+                    DateTime eventDateTime = DateTime.UtcNow; // fallback
                     if (parts.Length > 2 && DateTime.TryParseExact(parts[2], "yyyy-MM-dd'T'HH:mm:ss", 
                             CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime dt))
                     {
+                        eventDateTime = dt;
                         entry.EventDateTime = dt;
                     }
                     
-                    if (parts.Length > 3) entry.EventClass = parts[3]; // Usually "System"
-                    if (parts.Length > 4) entry.EventSeverity = parts[4]; // Usually "Info"
-                    
-                    // The event message is typically at the end after several dashes
-                    // Find the message by looking for the pattern of dashes and then taking the rest
+                    // Extract event message for hash generation
+                    string eventMsg = "";
                     int msgIndex = -1;
                     for (int i = 5; i < parts.Length - 1; i++)
                     {
@@ -168,8 +163,17 @@ namespace Log2Postgres.Core.Services
                     
                     if (msgIndex > 0 && msgIndex < parts.Length)
                     {
-                        entry.EventMsg = string.Join(" ", parts.Skip(msgIndex));
+                        eventMsg = string.Join(" ", parts.Skip(msgIndex));
+                        entry.EventMsg = eventMsg;
                     }
+                    
+                    // Generate synthetic unique message ID instead of using "0-0"
+                    entry.MessageId = GenerateSyntheticMessageId(eventDateTime, eventMsg);
+                    
+                    // Set other fields
+                    entry.EventSource = parts[1]; // Usually "-"
+                    if (parts.Length > 3) entry.EventClass = parts[3]; // Usually "System"
+                    if (parts.Length > 4) entry.EventSeverity = parts[4]; // Usually "Info"
                     
                     return entry;
                 }
@@ -268,6 +272,22 @@ namespace Log2Postgres.Core.Services
                 _logger.LogError(ex, "Error parsing log entry: {Line}", line);
                 return null;
             }
+        }
+        
+        /// <summary>
+        /// Generates a synthetic unique message ID for system messages that would otherwise have "0-0"
+        /// Format: SYS-{timestamp-ticks}-{content-hash}
+        /// </summary>
+        private static string GenerateSyntheticMessageId(DateTime eventDateTime, string eventMsg)
+        {
+            // Use ticks for high precision timestamp (unique within 100 nanoseconds)
+            long ticks = eventDateTime.Ticks;
+            
+            // Generate a short hash of the event message for uniqueness when timestamps are identical
+            int contentHash = eventMsg.GetHashCode();
+            string hashHex = Math.Abs(contentHash).ToString("X4");
+            
+            return $"SYS-{ticks}-{hashHex}";
         }
     }
 } 

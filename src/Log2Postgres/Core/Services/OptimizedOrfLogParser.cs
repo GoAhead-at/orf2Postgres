@@ -253,27 +253,24 @@ namespace Log2Postgres.Core.Services
             var entry = new OrfLogEntry
             {
                 SourceFilename = sourceFilename,
-                MessageId = line[ranges[0]].ToString(),
                 ProcessedAt = DateTime.UtcNow
             };
 
-            if (rangeCount > 1) entry.EventSource = line[ranges[1]].ToString();
-
-            // Parse datetime from a system message (third component)
+            // Parse datetime first to use in synthetic ID generation
+            DateTime eventDateTime = DateTime.UtcNow; // fallback
             if (rangeCount > 2)
             {
                 var dateTimeSpan = line[ranges[2]];
                 if (DateTime.TryParseExact(dateTimeSpan, "yyyy-MM-dd'T'HH:mm:ss", 
                     CultureInfo.InvariantCulture, DateTimeStyles.None, out DateTime dt))
                 {
+                    eventDateTime = dt;
                     entry.EventDateTime = dt;
                 }
             }
 
-            if (rangeCount > 3) entry.EventClass = line[ranges[3]].ToString();
-            if (rangeCount > 4) entry.EventSeverity = line[ranges[4]].ToString();
-
-            // Find the message by looking for the pattern of dashes
+            // Extract event message for hash generation
+            string eventMsg = "";
             for (int i = 5; i < rangeCount - 1; i++)
             {
                 if (line[ranges[i]].SequenceEqual("-".AsSpan()) && 
@@ -288,13 +285,39 @@ namespace Log2Postgres.Core.Services
                             if (j > i + 2) _stringBuilder.Append(' ');
                             _stringBuilder.Append(line[ranges[j]]);
                         }
-                        entry.EventMsg = _stringBuilder.ToString();
+                        eventMsg = _stringBuilder.ToString();
+                        entry.EventMsg = eventMsg;
                     }
                     break;
                 }
             }
 
+            // Generate synthetic unique message ID instead of using "0-0"
+            entry.MessageId = GenerateSyntheticMessageId(eventDateTime, eventMsg);
+
+            // Set other fields
+            if (rangeCount > 1) entry.EventSource = line[ranges[1]].ToString();
+            if (rangeCount > 3) entry.EventClass = line[ranges[3]].ToString();
+            if (rangeCount > 4) entry.EventSeverity = line[ranges[4]].ToString();
+
             return entry;
+        }
+
+        /// <summary>
+        /// Generates a synthetic unique message ID for system messages that would otherwise have "0-0"
+        /// Format: SYS-{timestamp-ticks}-{content-hash}
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static string GenerateSyntheticMessageId(DateTime eventDateTime, string eventMsg)
+        {
+            // Use ticks for high precision timestamp (unique within 100 nanoseconds)
+            long ticks = eventDateTime.Ticks;
+            
+            // Generate a short hash of the event message for uniqueness when timestamps are identical
+            int contentHash = eventMsg.GetHashCode();
+            string hashHex = Math.Abs(contentHash).ToString("X4");
+            
+            return $"SYS-{ticks}-{hashHex}";
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
