@@ -96,6 +96,11 @@ public partial class MainWindow : Window, IAsyncDisposable
     private bool _hasReceivedStatusSinceRestart = false;
     private int _ipcReconnectionAttempts = 0;
     private const int MaxIpcReconnectionAttempts = 10;
+    
+    // Add status stability fields to reduce flickering
+    private string _lastDisplayedStatus = string.Empty;
+    private DateTime _lastStatusChange = DateTime.MinValue;
+    private const int StatusStabilityDelayMs = 2000; // Only update UI if status has been stable for 2 seconds
 
 #pragma warning disable CS8618
     public string ServiceOperationalState { get; set; } = string.Empty;
@@ -193,38 +198,61 @@ public partial class MainWindow : Window, IAsyncDisposable
 
         Dispatcher.Invoke(() =>
         {
-            // Cache the received status and reset reconnection attempts on successful IPC communication
-            _lastKnownServiceStatus = status;
-            _lastStatusUpdateTime = DateTime.Now;
-            _hasReceivedStatusSinceRestart = true;
-            _ipcReconnectionAttempts = 0;
+            // Check if status has actually changed to reduce flickering
+            string newStatusText = status.IsProcessing ? "Processing" : status.ServiceOperationalState;
+            bool statusChanged = newStatusText != _lastDisplayedStatus;
             
-            // We have IPC status, so service is available via IPC.
-            // We still need SC status for install/start/stop buttons.
-            bool isServiceInstalled = false;
-            ServiceControllerStatus currentScStatus = ServiceControllerStatus.Stopped;
-            try
+            if (statusChanged)
             {
-                using (var sc = new ServiceController(App.WindowsServiceName)) // Use constant from App.xaml.cs
+                _lastStatusChange = DateTime.Now;
+                _logger.LogDebug("Service status changed from '{OldStatus}' to '{NewStatus}'", _lastDisplayedStatus, newStatusText);
+            }
+            
+            // Only update UI if status has been stable for the stability delay or if it's an important change
+            bool shouldUpdateImmediately = statusChanged && (
+                status.ServiceOperationalState == "Error" || // Always show errors immediately
+                _lastDisplayedStatus == "Error" || // Always clear error status immediately  
+                string.IsNullOrEmpty(_lastDisplayedStatus) // First status update
+            );
+            
+            bool isStable = !statusChanged && (DateTime.Now - _lastStatusChange).TotalMilliseconds >= StatusStabilityDelayMs;
+            
+                        if (shouldUpdateImmediately || isStable)
+            {
+                // Cache the received status and reset reconnection attempts on successful IPC communication
+                _lastKnownServiceStatus = status;
+                _lastStatusUpdateTime = DateTime.Now;
+                _hasReceivedStatusSinceRestart = true;
+                _ipcReconnectionAttempts = 0;
+                _lastDisplayedStatus = newStatusText;
+                
+                // We have IPC status, so service is available via IPC.
+                // We still need SC status for install/start/stop buttons.
+                bool isServiceInstalled = false;
+                ServiceControllerStatus currentScStatus = ServiceControllerStatus.Stopped;
+                try
                 {
-                    isServiceInstalled = true;
-                    currentScStatus = sc.Status;
+                    using (var sc = new ServiceController(App.WindowsServiceName)) // Use constant from App.xaml.cs
+                    {
+                        isServiceInstalled = true;
+                        currentScStatus = sc.Status;
+                    }
                 }
-            }
-            catch (InvalidOperationException) 
-            {
-                _logger.LogTrace("SC status check in OnIpcServiceStatusReceived: Service not installed.");
-                isServiceInstalled = false; 
-            }
-            catch (Exception ex) 
-            { 
-                _logger.LogError(ex, "Error getting SC status in OnIpcServiceStatusReceived");
-                // Keep defaults: isServiceInstalled = false, currentScStatus = ServiceControllerStatus.Stopped;
-            }
+                catch (InvalidOperationException) 
+                {
+                    _logger.LogTrace("SC status check in OnIpcServiceStatusReceived: Service not installed.");
+                    isServiceInstalled = false; 
+                }
+                catch (Exception ex) 
+                { 
+                    _logger.LogError(ex, "Error getting SC status in OnIpcServiceStatusReceived");
+                    // Keep defaults: isServiceInstalled = false, currentScStatus = ServiceControllerStatus.Stopped;
+                }
 
-            // Call the main UI update method WITH the received pipeStatus
-            // The 'true' for serviceAvailable indicates IPC is connected and providing this status.
-            UpdateUiWithServiceStatus(status, true, currentScStatus, isServiceInstalled);
+                // Call the main UI update method WITH the received pipeStatus
+                // The 'true' for serviceAvailable indicates IPC is connected and providing this status.
+                UpdateUiWithServiceStatus(status, true, currentScStatus, isServiceInstalled);
+            }
         });
         return Task.CompletedTask;
     }
@@ -237,7 +265,7 @@ public partial class MainWindow : Window, IAsyncDisposable
 
         _serviceStatusTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromSeconds(3)
+            Interval = TimeSpan.FromSeconds(5) // Increased from 3 to 5 seconds to reduce status request frequency
         };
         _serviceStatusTimer.Tick += ServiceStatusTimer_Tick;
         _serviceStatusTimer.Start();
