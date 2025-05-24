@@ -31,7 +31,8 @@ namespace Log2Postgres.Core.Services
         private TaskCompletionSource<bool> _ipcServerReadySignal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         private readonly ILogger<LogFileWatcher> _logger;
-        private readonly OrfLogParser _logParser;
+        private readonly OrfLogParser _logParser; // Keep for backward compatibility if needed
+        private readonly IOptimizedLogFileProcessor _optimizedProcessor;
         private readonly PositionManager _positionManager = null!;
         private readonly PostgresService _postgresService;
         private readonly IOptionsMonitor<LogMonitorSettings> _optionsMonitor;
@@ -93,6 +94,7 @@ namespace Log2Postgres.Core.Services
         public LogFileWatcher(
             ILogger<LogFileWatcher> logger,
             OrfLogParser logParser,
+            IOptimizedLogFileProcessor optimizedProcessor,
             PositionManager positionManager,
             PostgresService postgresService,
             IOptionsMonitor<LogMonitorSettings> optionsMonitor,
@@ -100,7 +102,8 @@ namespace Log2Postgres.Core.Services
             IOptions<WindowsServiceSettings> serviceSettingsOptions)
         {
             _logger = logger;
-            _logParser = logParser;
+            _logParser = logParser; // Keep for backward compatibility
+            _optimizedProcessor = optimizedProcessor;
             _positionManager = positionManager;
             _postgresService = postgresService;
             _optionsMonitor = optionsMonitor;
@@ -479,62 +482,48 @@ namespace Log2Postgres.Core.Services
                 CurrentPosition = startPosition;
                 _logger.LogDebug("Starting from position {Position} in file {FilePath}", startPosition, filePath);
                 
-                _logger.LogDebug("Parsing log file {FilePath} from position {Position}", filePath, startPosition);
-                var (entries, newPosition) = _logParser.ParseLogFile(filePath, startPosition);
-                cancellationToken.ThrowIfCancellationRequested(); // Check after potentially long synchronous operation
-                _logger.LogDebug("Parsed {Count} entries from {FilePath}, new position: {NewPosition}", 
-                    entries.Count, filePath, newPosition);
+                _logger.LogDebug("Processing log file {FilePath} from position {Position} using optimized processor", filePath, startPosition);
+                var processingResult = await _optimizedProcessor.ProcessFileAsync(filePath, startPosition, cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
                 
-                if (entries.Count > 0)
+                if (!processingResult.Success)
                 {
-                    TotalLinesProcessed += entries.Count;
+                    _logger.LogError("Failed to process file {FilePath}: {Error}", filePath, processingResult.ErrorMessage);
+                    NotifyError("File Processing", $"Failed to process {Path.GetFileName(filePath)}: {processingResult.ErrorMessage}");
+                    return;
+                }
+                
+                _logger.LogDebug("Processed {EntriesProcessed} entries from {FilePath}, {EntriesSaved} saved, new position: {NewPosition}", 
+                    processingResult.EntriesProcessed, filePath, processingResult.EntriesSaved, processingResult.NewPosition);
+                
+                if (processingResult.EntriesProcessed > 0)
+                {
+                    // Update our tracking statistics
+                    TotalLinesProcessed += processingResult.EntriesProcessed;
+                    EntriesSavedToDb += processingResult.EntriesSaved;
+                    CurrentPosition = processingResult.NewPosition;
+                    LastProcessedTime = DateTime.Now;
                     
-                    _logger.LogDebug("Notifying UI of processing status update (pre-DB save)");
-                    ProcessingStatusChanged?.Invoke(CurrentFile, entries.Count, newPosition); 
-                    EntriesProcessed?.Invoke(entries); 
+                    // The optimized processor has already handled database saving and position updates
+                    // Just notify UI and IPC about the processing results
+                    _logger.LogDebug("Notifying UI of processing completion");
+                    ProcessingStatusChanged?.Invoke(CurrentFile, processingResult.EntriesProcessed, processingResult.NewPosition);
                     
-                    // Send a processing status message to IPC before sending the entries
-                    await SendProcessingStatusMessageToIpcAsync(Path.GetFileName(filePath), entries.Count, TotalLinesProcessed);
-                    await SendLogEntriesToIpcClientAsync(entries);
-
-                    try
+                    // Send processing status to IPC
+                    await SendProcessingStatusMessageToIpcAsync(Path.GetFileName(filePath), processingResult.EntriesProcessed, TotalLinesProcessed);
+                    
+                    _logger.LogInformation("Processed and saved {EntriesProcessed}/{EntriesSaved} entries from {FilePath} in {ProcessingTime}ms", 
+                        processingResult.EntriesProcessed, processingResult.EntriesSaved, filePath, processingResult.ProcessingTime.TotalMilliseconds);
+                    
+                    // Check for partial saves and warn if needed
+                    if (processingResult.EntriesSaved < processingResult.EntriesProcessed)
                     {
-                        _logger.LogDebug("Saving {Count} log entries to database", entries.Count);
-                        int savedEntries = await _postgresService.SaveEntriesAsync(entries, cancellationToken);
-                        cancellationToken.ThrowIfCancellationRequested();
-                        EntriesSavedToDb += savedEntries;
-                        
-                        if (savedEntries == entries.Count)
-                        {
-                            _logger.LogDebug("Successfully saved all {Count} entries to database. Updating position.", savedEntries);
-                            // Update position only after successful save
-                            CurrentPosition = newPosition;
-                            LastProcessedTime = DateTime.Now;
-                            await _positionManager.UpdatePositionAsync(filePath, newPosition, cancellationToken);
-                            cancellationToken.ThrowIfCancellationRequested();
-                            _logger.LogInformation("Processed and saved {Count} entries from {FilePath}", entries.Count, filePath);
-                            await SendCurrentStatusToIpcClientAsync(cancellationToken).ConfigureAwait(false);
-                        }
-                        else if (savedEntries > 0)
-                        {
-                             _logger.LogWarning("Only {SavedCount} of {TotalCount} entries were saved to database (some may be duplicates or other issues). Position NOT updated.",
-                                savedEntries, entries.Count);
-                             NotifyError("Database", $"Partial save: {savedEntries}/{entries.Count} entries from {Path.GetFileName(filePath)}. Log position not updated.");
-                             // Decide if CurrentPosition and LastProcessedTime should be updated here
-                             // For now, they are not, as the position file isn't updated.
-                        }
-                        else // savedEntries == 0 and no exception
-                        {
-                            _logger.LogWarning("No entries were saved to database from {FilePath} (count: {TotalCount}). Position NOT updated.", filePath, entries.Count);
-                            NotifyError("Database", $"Zero entries saved from {Path.GetFileName(filePath)}. Log position not updated.");
-                        }
+                        _logger.LogWarning("Partial save occurred: {SavedCount} of {ProcessedCount} entries saved from {FilePath}",
+                            processingResult.EntriesSaved, processingResult.EntriesProcessed, filePath);
+                        NotifyError("Database", $"Partial save: {processingResult.EntriesSaved}/{processingResult.EntriesProcessed} entries from {Path.GetFileName(filePath)}");
                     }
-                    catch (Exception ex)
-                    {
-                        _logger.LogError(ex, "Error saving entries to database: {Message}. Position NOT updated.", ex.Message);
-                        NotifyError("Database", $"Failed to save entries from {Path.GetFileName(filePath)}: {ex.Message}. Log position not updated.");
-                        // Position will not be updated due to the exception.
-                    }
+                    
+                    await SendCurrentStatusToIpcClientAsync(cancellationToken).ConfigureAwait(false);
                 }
                 else
                 {

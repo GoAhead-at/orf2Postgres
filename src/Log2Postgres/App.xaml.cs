@@ -346,6 +346,10 @@ namespace Log2Postgres
                 // Register infrastructure services
                 services.AddSingleton<Infrastructure.Resilience.IResilienceService, Infrastructure.Resilience.ResilienceService>();
                 services.AddSingleton<Infrastructure.Resources.IResourceManager, Infrastructure.Resources.ResourceManager>();
+                
+                // Register optimized performance services
+                services.AddSingleton<Core.Services.OptimizedOrfLogParser>();
+                services.AddSingleton<Core.Services.IOptimizedLogFileProcessor, Core.Services.OptimizedLogFileProcessor>();
             });
 
             return hostBuilder;
