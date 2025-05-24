@@ -2,6 +2,12 @@
 
 A high-performance .NET 8 application that monitors ORF log files and ingests them into PostgreSQL with enterprise-grade optimization, resilience patterns, and modern MVVM architecture. This dual-purpose application includes both a Windows Service for continuous background monitoring and a sophisticated WPF UI for configuration and management.
 
+## 📸 Application Interface
+
+![ORF Log File Watcher Interface](DOCS/images/ORF%20Log%20File%20Watcher.png)
+
+*Modern WPF interface featuring database configuration, log file settings, service management, real-time processing status, and comprehensive logging with Material Design components.*
+
 ## 🚀 Key Features
 
 ### Core Functionality
