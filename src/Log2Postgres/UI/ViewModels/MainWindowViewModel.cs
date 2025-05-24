@@ -42,6 +42,7 @@ namespace Log2Postgres.UI.ViewModels
         private ServiceControllerStatus _serviceStatus = ServiceControllerStatus.Stopped;
         private bool _isIpcConnected;
         private bool _isLoadingConfiguration;
+        private long _localProcessingTotalLines;
 
         public MainWindowViewModel(
             ILogger<MainWindowViewModel> logger,
@@ -511,6 +512,10 @@ namespace Log2Postgres.UI.ViewModels
         {
             try
             {
+                // Reset local processing counter when starting
+                _localProcessingTotalLines = 0;
+                TotalLinesProcessed = 0;
+                
                 // Only start local processing - service has its own Start/Stop commands
                 await _logFileWatcher.UIManagedStartProcessingAsync();
                 IsProcessing = true;
@@ -703,7 +708,11 @@ namespace Log2Postgres.UI.ViewModels
         {
             CurrentFile = System.IO.Path.GetFileName(currentFile);
             CurrentPosition = position;
-            TotalLinesProcessed = count; // Convert int to long implicitly
+            
+            // For local processing, accumulate the lines processed
+            // The 'count' parameter represents new lines processed in this batch
+            _localProcessingTotalLines += count;
+            TotalLinesProcessed = _localProcessingTotalLines;
         }
 
         private void OnEntriesProcessed(System.Collections.Generic.IEnumerable<Core.Models.OrfLogEntry> entries)
@@ -781,7 +790,14 @@ namespace Log2Postgres.UI.ViewModels
             ServiceOperationalState = status.ServiceOperationalState;
             CurrentFile = System.IO.Path.GetFileName(status.CurrentFile);
             CurrentPosition = status.CurrentPosition;
-            TotalLinesProcessed = status.TotalLinesProcessedSinceStart; // long to long assignment
+            
+            // Only update TotalLinesProcessed from IPC if we're not doing local processing
+            // Local processing maintains its own accumulated count
+            if (!IsProcessing || IsIpcConnected)
+            {
+                TotalLinesProcessed = status.TotalLinesProcessedSinceStart;
+            }
+            
             IsProcessing = status.IsProcessing;
         }
 
