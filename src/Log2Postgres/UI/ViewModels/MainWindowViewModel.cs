@@ -1,0 +1,707 @@
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Runtime.CompilerServices;
+using System.ServiceProcess;
+using System.Threading.Tasks;
+using System.Windows.Input;
+using Log2Postgres.Core.Services;
+using Log2Postgres.UI.Services;
+
+namespace Log2Postgres.UI.ViewModels
+{
+    /// <summary>
+    /// ViewModel for the MainWindow, implementing MVVM pattern
+    /// </summary>
+    public class MainWindowViewModel : INotifyPropertyChanged, IDisposable
+    {
+        private readonly ILogger<MainWindowViewModel> _logger;
+        private readonly IServiceManager _serviceManager;
+        private readonly IAppConfigurationManager _configurationManager;
+        private readonly PostgresService _postgresService;
+        private readonly LogFileWatcher _logFileWatcher;
+        private readonly IIpcService _ipcService;
+
+        // UI State Properties
+        private bool _isProcessing;
+        private string _currentFile = "N/A";
+        private long _currentPosition;
+        private long _totalLinesProcessed;
+        private string _serviceOperationalState = "Stopped";
+        private bool _isDatabaseConnected;
+        private string _lastErrorMessage = string.Empty;
+        private ObservableCollection<string> _logEntries = new();
+
+        // Configuration Properties
+        private string _databaseHost = "localhost";
+        private string _databasePort = "5432";
+        private string _databaseUsername = string.Empty;
+        private string _databasePassword = string.Empty;
+        private string _databaseName = "orf";
+        private string _databaseSchema = "orf";
+        private string _databaseTable = "orf_logs";
+        private int _connectionTimeout = 30;
+        private string _logDirectory = string.Empty;
+        private string _logFilePattern = "orfee-{Date:yyyy-MM-dd}.log";
+        private int _pollingInterval = 5;
+
+        // Service State Properties
+        private bool _isServiceInstalled;
+        private ServiceControllerStatus _serviceStatus = ServiceControllerStatus.Stopped;
+        private bool _isIpcConnected;
+
+        public MainWindowViewModel(
+            ILogger<MainWindowViewModel> logger,
+            IServiceManager serviceManager,
+            IAppConfigurationManager configurationManager,
+            PostgresService postgresService,
+            LogFileWatcher logFileWatcher,
+            IIpcService ipcService)
+        {
+            _logger = logger;
+            _serviceManager = serviceManager;
+            _configurationManager = configurationManager;
+            _postgresService = postgresService;
+            _logFileWatcher = logFileWatcher;
+            _ipcService = ipcService;
+
+            InitializeCommands();
+            SubscribeToEvents();
+        }
+
+        #region Properties
+
+        public bool IsProcessing
+        {
+            get => _isProcessing;
+            set => SetProperty(ref _isProcessing, value);
+        }
+
+        public string CurrentFile
+        {
+            get => _currentFile;
+            set => SetProperty(ref _currentFile, value);
+        }
+
+        public long CurrentPosition
+        {
+            get => _currentPosition;
+            set => SetProperty(ref _currentPosition, value);
+        }
+
+        public long TotalLinesProcessed
+        {
+            get => _totalLinesProcessed;
+            set => SetProperty(ref _totalLinesProcessed, value);
+        }
+
+        public string ServiceOperationalState
+        {
+            get => _serviceOperationalState;
+            set => SetProperty(ref _serviceOperationalState, value);
+        }
+
+        public bool IsDatabaseConnected
+        {
+            get => _isDatabaseConnected;
+            set => SetProperty(ref _isDatabaseConnected, value);
+        }
+
+        public string LastErrorMessage
+        {
+            get => _lastErrorMessage;
+            set => SetProperty(ref _lastErrorMessage, value);
+        }
+
+        public ObservableCollection<string> LogEntries => _logEntries;
+
+        // Configuration Properties
+        public string DatabaseHost
+        {
+            get => _databaseHost;
+            set
+            {
+                if (SetProperty(ref _databaseHost, value))
+                    _configurationManager.MarkAsChanged();
+            }
+        }
+
+        public string DatabasePort
+        {
+            get => _databasePort;
+            set
+            {
+                if (SetProperty(ref _databasePort, value))
+                    _configurationManager.MarkAsChanged();
+            }
+        }
+
+        public string DatabaseUsername
+        {
+            get => _databaseUsername;
+            set
+            {
+                if (SetProperty(ref _databaseUsername, value))
+                    _configurationManager.MarkAsChanged();
+            }
+        }
+
+        public string DatabasePassword
+        {
+            get => _databasePassword;
+            set
+            {
+                if (SetProperty(ref _databasePassword, value))
+                    _configurationManager.MarkAsChanged();
+            }
+        }
+
+        public string DatabaseName
+        {
+            get => _databaseName;
+            set
+            {
+                if (SetProperty(ref _databaseName, value))
+                    _configurationManager.MarkAsChanged();
+            }
+        }
+
+        public string DatabaseSchema
+        {
+            get => _databaseSchema;
+            set
+            {
+                if (SetProperty(ref _databaseSchema, value))
+                    _configurationManager.MarkAsChanged();
+            }
+        }
+
+        public string DatabaseTable
+        {
+            get => _databaseTable;
+            set
+            {
+                if (SetProperty(ref _databaseTable, value))
+                    _configurationManager.MarkAsChanged();
+            }
+        }
+
+        public int ConnectionTimeout
+        {
+            get => _connectionTimeout;
+            set
+            {
+                if (SetProperty(ref _connectionTimeout, value))
+                    _configurationManager.MarkAsChanged();
+            }
+        }
+
+        public string LogDirectory
+        {
+            get => _logDirectory;
+            set
+            {
+                if (SetProperty(ref _logDirectory, value))
+                    _configurationManager.MarkAsChanged();
+            }
+        }
+
+        public string LogFilePattern
+        {
+            get => _logFilePattern;
+            set
+            {
+                if (SetProperty(ref _logFilePattern, value))
+                    _configurationManager.MarkAsChanged();
+            }
+        }
+
+        public int PollingInterval
+        {
+            get => _pollingInterval;
+            set
+            {
+                if (SetProperty(ref _pollingInterval, value))
+                    _configurationManager.MarkAsChanged();
+            }
+        }
+
+        // Service State Properties
+        public bool IsServiceInstalled
+        {
+            get => _isServiceInstalled;
+            set => SetProperty(ref _isServiceInstalled, value);
+        }
+
+        public ServiceControllerStatus ServiceStatus
+        {
+            get => _serviceStatus;
+            set => SetProperty(ref _serviceStatus, value);
+        }
+
+        public bool IsIpcConnected
+        {
+            get => _isIpcConnected;
+            set => SetProperty(ref _isIpcConnected, value);
+        }
+
+        public bool HasUnsavedChanges => _configurationManager.HasUnsavedChanges;
+
+        #endregion
+
+        #region Commands
+
+        public ICommand TestConnectionCommand { get; private set; } = null!;
+        public ICommand VerifyTableCommand { get; private set; } = null!;
+        public ICommand SaveConfigurationCommand { get; private set; } = null!;
+        public ICommand ResetConfigurationCommand { get; private set; } = null!;
+        public ICommand InstallServiceCommand { get; private set; } = null!;
+        public ICommand UninstallServiceCommand { get; private set; } = null!;
+        public ICommand StartProcessingCommand { get; private set; } = null!;
+        public ICommand StopProcessingCommand { get; private set; } = null!;
+        public ICommand ClearLogsCommand { get; private set; } = null!;
+
+        #endregion
+
+        private void InitializeCommands()
+        {
+            TestConnectionCommand = new AsyncRelayCommand(TestConnectionAsync);
+            VerifyTableCommand = new AsyncRelayCommand(VerifyTableAsync);
+            SaveConfigurationCommand = new AsyncRelayCommand(SaveConfigurationAsync);
+            ResetConfigurationCommand = new AsyncRelayCommand(ResetConfigurationAsync);
+            InstallServiceCommand = new AsyncRelayCommand(InstallServiceAsync);
+            UninstallServiceCommand = new AsyncRelayCommand(UninstallServiceAsync);
+            StartProcessingCommand = new AsyncRelayCommand(StartProcessingAsync);
+            StopProcessingCommand = new AsyncRelayCommand(StopProcessingAsync);
+            ClearLogsCommand = new RelayCommand(ClearLogs);
+        }
+
+        private void SubscribeToEvents()
+        {
+            _serviceManager.ServiceStatusChanged += OnServiceStatusChanged;
+            _configurationManager.ConfigurationChanged += OnConfigurationChanged;
+            _configurationManager.UnsavedChangesChanged += OnUnsavedChangesChanged;
+            
+            if (_logFileWatcher != null)
+            {
+                _logFileWatcher.ProcessingStatusChanged += OnProcessingStatusChanged;
+                _logFileWatcher.EntriesProcessed += OnEntriesProcessed;
+                _logFileWatcher.ErrorOccurred += OnErrorOccurred;
+            }
+
+            if (_ipcService != null)
+            {
+                _ipcService.PipeConnected += OnIpcConnected;
+                _ipcService.PipeDisconnected += OnIpcDisconnected;
+                _ipcService.ServiceStatusReceived += OnServiceStatusReceived;
+                _ipcService.LogEntriesReceived += OnLogEntriesReceived;
+            }
+        }
+
+        public async Task InitializeAsync()
+        {
+            _logger.LogInformation("Initializing MainWindow ViewModel");
+            
+            await _configurationManager.LoadSettingsAsync();
+            await _serviceManager.RefreshServiceStatusAsync();
+            await UpdateDatabaseConnectionStatusAsync();
+        }
+
+        #region Command Implementations
+
+        private async Task TestConnectionAsync()
+        {
+            try
+            {
+                _logger.LogInformation("Testing database connection");
+                var isConnected = await _postgresService.TestConnectionAsync();
+                IsDatabaseConnected = isConnected;
+                
+                if (isConnected)
+                {
+                    AddLogEntry("✓ Database connection successful");
+                }
+                else
+                {
+                    AddLogEntry("✗ Database connection failed");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error testing database connection");
+                AddLogEntry($"✗ Database connection error: {ex.Message}");
+                IsDatabaseConnected = false;
+            }
+        }
+
+        private async Task VerifyTableAsync()
+        {
+            try
+            {
+                _logger.LogInformation("Verifying database table");
+                var tableExists = await _postgresService.TableExistsAsync();
+                
+                if (tableExists)
+                {
+                    var isValid = await _postgresService.ValidateTableStructureAsync();
+                    if (isValid)
+                    {
+                        AddLogEntry("✓ Database table exists and structure is valid");
+                    }
+                    else
+                    {
+                        AddLogEntry("⚠ Database table exists but structure is invalid");
+                    }
+                }
+                else
+                {
+                    AddLogEntry("✗ Database table does not exist");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error verifying database table");
+                AddLogEntry($"✗ Table verification error: {ex.Message}");
+            }
+        }
+
+        private async Task SaveConfigurationAsync()
+        {
+            try
+            {
+                                var dbSettings = new Core.Services.DatabaseSettings                {                    Host = DatabaseHost,                    Port = DatabasePort,                    Username = DatabaseUsername,                    Password = DatabasePassword,                    Database = DatabaseName,                    Schema = DatabaseSchema,                    Table = DatabaseTable,                    ConnectionTimeout = ConnectionTimeout                };                var logSettings = new Core.Services.LogMonitorSettings                {                    BaseDirectory = LogDirectory,                    LogFilePattern = LogFilePattern,                    PollingIntervalSeconds = PollingInterval                };
+
+                await _configurationManager.SaveSettingsAsync(dbSettings, logSettings);
+                AddLogEntry("✓ Configuration saved successfully");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error saving configuration");
+                AddLogEntry($"✗ Configuration save error: {ex.Message}");
+            }
+        }
+
+        private async Task ResetConfigurationAsync()
+        {
+            try
+            {
+                await _configurationManager.ResetToDefaultsAsync();
+                AddLogEntry("✓ Configuration reset to defaults");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error resetting configuration");
+                AddLogEntry($"✗ Configuration reset error: {ex.Message}");
+            }
+        }
+
+        private async Task InstallServiceAsync()
+        {
+            try
+            {
+                await _serviceManager.InstallServiceAsync();
+                AddLogEntry("✓ Service installation initiated");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error installing service");
+                AddLogEntry($"✗ Service installation error: {ex.Message}");
+            }
+        }
+
+        private async Task UninstallServiceAsync()
+        {
+            try
+            {
+                await _serviceManager.UninstallServiceAsync();
+                AddLogEntry("✓ Service uninstallation initiated");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error uninstalling service");
+                AddLogEntry($"✗ Service uninstallation error: {ex.Message}");
+            }
+        }
+
+        private async Task StartProcessingAsync()
+        {
+            try
+            {
+                if (IsServiceInstalled)
+                {
+                    await _serviceManager.StartServiceAsync();
+                    AddLogEntry("✓ Service start initiated");
+                }
+                else
+                {
+                    await _logFileWatcher.UIManagedStartProcessingAsync();
+                    IsProcessing = true;
+                    AddLogEntry("✓ Local processing started");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error starting processing");
+                AddLogEntry($"✗ Start processing error: {ex.Message}");
+            }
+        }
+
+        private async Task StopProcessingAsync()
+        {
+            try
+            {
+                if (IsServiceInstalled)
+                {
+                    await _serviceManager.StopServiceAsync();
+                    AddLogEntry("✓ Service stop initiated");
+                }
+                else
+                {
+                    _logFileWatcher.UIManagedStopProcessing();
+                    IsProcessing = false;
+                    AddLogEntry("✓ Local processing stopped");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error stopping processing");
+                AddLogEntry($"✗ Stop processing error: {ex.Message}");
+            }
+        }
+
+        private void ClearLogs()
+        {
+            LogEntries.Clear();
+            _logger.LogInformation("UI logs cleared");
+        }
+
+        #endregion
+
+        #region Event Handlers
+
+        private void OnServiceStatusChanged(object? sender, ServiceStatusChangedEventArgs e)
+        {
+            IsServiceInstalled = e.IsInstalled;
+            ServiceStatus = e.Status;
+            _logger.LogDebug("Service status changed: Installed={IsInstalled}, Status={Status}", 
+                e.IsInstalled, e.Status);
+        }
+
+        private void OnConfigurationChanged(object? sender, ConfigurationChangedEventArgs e)
+        {
+            // Update UI properties from configuration
+            DatabaseHost = e.DatabaseSettings.Host;
+            DatabasePort = e.DatabaseSettings.Port;
+            DatabaseUsername = e.DatabaseSettings.Username;
+            DatabasePassword = e.DatabaseSettings.Password;
+            DatabaseName = e.DatabaseSettings.Database;
+            DatabaseSchema = e.DatabaseSettings.Schema;
+            DatabaseTable = e.DatabaseSettings.Table;
+            ConnectionTimeout = e.DatabaseSettings.ConnectionTimeout;
+            
+            LogDirectory = e.LogSettings.BaseDirectory;
+            LogFilePattern = e.LogSettings.LogFilePattern;
+            PollingInterval = e.LogSettings.PollingIntervalSeconds;
+            
+            OnPropertyChanged(nameof(HasUnsavedChanges));
+        }
+
+        private void OnUnsavedChangesChanged(object? sender, EventArgs e)
+        {
+            OnPropertyChanged(nameof(HasUnsavedChanges));
+        }
+
+        private void OnProcessingStatusChanged(string currentFile, int count, long position)
+        {
+            CurrentFile = System.IO.Path.GetFileName(currentFile);
+            CurrentPosition = position;
+            TotalLinesProcessed = count; // Convert int to long implicitly
+        }
+
+        private void OnEntriesProcessed(System.Collections.Generic.IEnumerable<Core.Models.OrfLogEntry> entries)
+        {
+            foreach (var entry in entries)
+            {
+                AddLogEntry($"Processed: {entry.EventDateTime:HH:mm:ss} - {entry.EventAction} - {entry.Sender}");
+            }
+        }
+
+        private void OnErrorOccurred(string component, string message)
+        {
+            LastErrorMessage = $"[{component}] {message}";
+            AddLogEntry($"✗ Error in {component}: {message}");
+        }
+
+        private Task OnIpcConnected()
+        {
+            IsIpcConnected = true;
+            AddLogEntry("✓ IPC connection established");
+            return Task.CompletedTask;
+        }
+
+        private Task OnIpcDisconnected()
+        {
+            IsIpcConnected = false;
+            AddLogEntry("⚠ IPC connection lost");
+            return Task.CompletedTask;
+        }
+
+        private Task OnServiceStatusReceived(PipeServiceStatus status)
+        {
+            ServiceOperationalState = status.ServiceOperationalState;
+            CurrentFile = System.IO.Path.GetFileName(status.CurrentFile);
+            CurrentPosition = status.CurrentPosition;
+            TotalLinesProcessed = status.TotalLinesProcessedSinceStart; // long to long assignment
+            IsProcessing = status.IsProcessing;
+            return Task.CompletedTask;
+        }
+
+        private Task OnLogEntriesReceived(System.Collections.Generic.List<string> logEntries)
+        {
+            foreach (var entry in logEntries)
+            {
+                AddLogEntry(entry);
+            }
+            return Task.CompletedTask;
+        }
+
+        #endregion
+
+        private void AddLogEntry(string message)
+        {
+            const int maxLogEntries = 500;
+            
+            var timestampedMessage = $"[{DateTime.Now:HH:mm:ss}] {message}";
+            LogEntries.Add(timestampedMessage);
+            
+            // Keep log entries within limit
+            while (LogEntries.Count > maxLogEntries)
+            {
+                LogEntries.RemoveAt(0);
+            }
+        }
+
+        private async Task UpdateDatabaseConnectionStatusAsync()
+        {
+            try
+            {
+                IsDatabaseConnected = await _postgresService.TestConnectionAsync();
+            }
+            catch
+            {
+                IsDatabaseConnected = false;
+            }
+        }
+
+        #region INotifyPropertyChanged
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        protected virtual void OnPropertyChanged([CallerMemberName] string? propertyName = null)
+        {
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        }
+
+        protected bool SetProperty<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
+        {
+            if (System.Collections.Generic.EqualityComparer<T>.Default.Equals(field, value))
+                return false;
+
+            field = value;
+            OnPropertyChanged(propertyName);
+            return true;
+        }
+
+        #endregion
+
+        #region IDisposable
+
+        public void Dispose()
+        {
+            _serviceManager.ServiceStatusChanged -= OnServiceStatusChanged;
+            _configurationManager.ConfigurationChanged -= OnConfigurationChanged;
+            _configurationManager.UnsavedChangesChanged -= OnUnsavedChangesChanged;
+            
+            if (_logFileWatcher != null)
+            {
+                _logFileWatcher.ProcessingStatusChanged -= OnProcessingStatusChanged;
+                _logFileWatcher.EntriesProcessed -= OnEntriesProcessed;
+                _logFileWatcher.ErrorOccurred -= OnErrorOccurred;
+            }
+
+            if (_ipcService != null)
+            {
+                _ipcService.PipeConnected -= OnIpcConnected;
+                _ipcService.PipeDisconnected -= OnIpcDisconnected;
+                _ipcService.ServiceStatusReceived -= OnServiceStatusReceived;
+                _ipcService.LogEntriesReceived -= OnLogEntriesReceived;
+            }
+        }
+
+        #endregion
+    }
+
+    #region Command Helpers
+
+    public class RelayCommand : ICommand
+    {
+        private readonly Action _execute;
+        private readonly Func<bool>? _canExecute;
+
+        public RelayCommand(Action execute, Func<bool>? canExecute = null)
+        {
+            _execute = execute ?? throw new ArgumentNullException(nameof(execute));
+            _canExecute = canExecute;
+        }
+
+        public event EventHandler? CanExecuteChanged
+        {
+            add => CommandManager.RequerySuggested += value;
+            remove => CommandManager.RequerySuggested -= value;
+        }
+
+        public bool CanExecute(object? parameter) => _canExecute?.Invoke() ?? true;
+
+        public void Execute(object? parameter) => _execute();
+    }
+
+    public class AsyncRelayCommand : ICommand
+    {
+        private readonly Func<Task> _execute;
+        private readonly Func<bool>? _canExecute;
+        private bool _isExecuting;
+
+        public AsyncRelayCommand(Func<Task> execute, Func<bool>? canExecute = null)
+        {
+            _execute = execute ?? throw new ArgumentNullException(nameof(execute));
+            _canExecute = canExecute;
+        }
+
+        public event EventHandler? CanExecuteChanged
+        {
+            add => CommandManager.RequerySuggested += value;
+            remove => CommandManager.RequerySuggested -= value;
+        }
+
+        public bool CanExecute(object? parameter) => !_isExecuting && (_canExecute?.Invoke() ?? true);
+
+        public async void Execute(object? parameter)
+        {
+            if (CanExecute(parameter))
+            {
+                try
+                {
+                    _isExecuting = true;
+                    await _execute();
+                }
+                finally
+                {
+                    _isExecuting = false;
+                }
+            }
+        }
+    }
+
+    #endregion
+} 

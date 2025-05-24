@@ -337,6 +337,10 @@ namespace Log2Postgres
                     return serviceInstance;
                 });
 
+                // Register new UI services
+                services.AddSingleton<UI.Services.IServiceManager, UI.Services.ServiceManager>();
+                services.AddSingleton<UI.Services.IAppConfigurationManager, UI.Services.AppConfigurationManager>();
+                services.AddTransient<UI.ViewModels.MainWindowViewModel>();
                 services.AddTransient<MainWindow>();
             });
 
