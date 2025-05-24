@@ -41,6 +41,7 @@ namespace Log2Postgres.UI.ViewModels
         private bool _isServiceInstalled;
         private ServiceControllerStatus _serviceStatus = ServiceControllerStatus.Stopped;
         private bool _isIpcConnected;
+        private bool _isLoadingConfiguration;
 
         public MainWindowViewModel(
             ILogger<MainWindowViewModel> logger,
@@ -113,7 +114,7 @@ namespace Log2Postgres.UI.ViewModels
             get => _databaseHost;
             set
             {
-                if (SetProperty(ref _databaseHost, value))
+                if (SetProperty(ref _databaseHost, value) && !_isLoadingConfiguration)
                     _configurationManager.MarkAsChanged();
             }
         }
@@ -123,7 +124,7 @@ namespace Log2Postgres.UI.ViewModels
             get => _databasePort;
             set
             {
-                if (SetProperty(ref _databasePort, value))
+                if (SetProperty(ref _databasePort, value) && !_isLoadingConfiguration)
                     _configurationManager.MarkAsChanged();
             }
         }
@@ -133,7 +134,7 @@ namespace Log2Postgres.UI.ViewModels
             get => _databaseUsername;
             set
             {
-                if (SetProperty(ref _databaseUsername, value))
+                if (SetProperty(ref _databaseUsername, value) && !_isLoadingConfiguration)
                     _configurationManager.MarkAsChanged();
             }
         }
@@ -143,7 +144,7 @@ namespace Log2Postgres.UI.ViewModels
             get => _databasePassword;
             set
             {
-                if (SetProperty(ref _databasePassword, value))
+                if (SetProperty(ref _databasePassword, value) && !_isLoadingConfiguration)
                     _configurationManager.MarkAsChanged();
             }
         }
@@ -153,7 +154,7 @@ namespace Log2Postgres.UI.ViewModels
             get => _databaseName;
             set
             {
-                if (SetProperty(ref _databaseName, value))
+                if (SetProperty(ref _databaseName, value) && !_isLoadingConfiguration)
                     _configurationManager.MarkAsChanged();
             }
         }
@@ -163,7 +164,7 @@ namespace Log2Postgres.UI.ViewModels
             get => _databaseSchema;
             set
             {
-                if (SetProperty(ref _databaseSchema, value))
+                if (SetProperty(ref _databaseSchema, value) && !_isLoadingConfiguration)
                     _configurationManager.MarkAsChanged();
             }
         }
@@ -173,7 +174,7 @@ namespace Log2Postgres.UI.ViewModels
             get => _databaseTable;
             set
             {
-                if (SetProperty(ref _databaseTable, value))
+                if (SetProperty(ref _databaseTable, value) && !_isLoadingConfiguration)
                     _configurationManager.MarkAsChanged();
             }
         }
@@ -183,7 +184,7 @@ namespace Log2Postgres.UI.ViewModels
             get => _connectionTimeout;
             set
             {
-                if (SetProperty(ref _connectionTimeout, value))
+                if (SetProperty(ref _connectionTimeout, value) && !_isLoadingConfiguration)
                     _configurationManager.MarkAsChanged();
             }
         }
@@ -193,7 +194,7 @@ namespace Log2Postgres.UI.ViewModels
             get => _logDirectory;
             set
             {
-                if (SetProperty(ref _logDirectory, value))
+                if (SetProperty(ref _logDirectory, value) && !_isLoadingConfiguration)
                     _configurationManager.MarkAsChanged();
             }
         }
@@ -203,7 +204,7 @@ namespace Log2Postgres.UI.ViewModels
             get => _logFilePattern;
             set
             {
-                if (SetProperty(ref _logFilePattern, value))
+                if (SetProperty(ref _logFilePattern, value) && !_isLoadingConfiguration)
                     _configurationManager.MarkAsChanged();
             }
         }
@@ -213,7 +214,7 @@ namespace Log2Postgres.UI.ViewModels
             get => _pollingInterval;
             set
             {
-                if (SetProperty(ref _pollingInterval, value))
+                if (SetProperty(ref _pollingInterval, value) && !_isLoadingConfiguration)
                     _configurationManager.MarkAsChanged();
             }
         }
@@ -665,21 +666,32 @@ namespace Log2Postgres.UI.ViewModels
 
         private void OnConfigurationChanged(object? sender, ConfigurationChangedEventArgs e)
         {
-            // Update UI properties from configuration
-            DatabaseHost = e.DatabaseSettings.Host;
-            DatabasePort = e.DatabaseSettings.Port;
-            DatabaseUsername = e.DatabaseSettings.Username;
-            DatabasePassword = e.DatabaseSettings.Password;
-            DatabaseName = e.DatabaseSettings.Database;
-            DatabaseSchema = e.DatabaseSettings.Schema;
-            DatabaseTable = e.DatabaseSettings.Table;
-            ConnectionTimeout = e.DatabaseSettings.ConnectionTimeout;
+            // Set loading flag to prevent marking as changed during configuration loading
+            _isLoadingConfiguration = true;
             
-            LogDirectory = e.LogSettings.BaseDirectory;
-            LogFilePattern = e.LogSettings.LogFilePattern;
-            PollingInterval = e.LogSettings.PollingIntervalSeconds;
-            
-            OnPropertyChanged(nameof(HasUnsavedChanges));
+            try
+            {
+                // Update UI properties from configuration
+                DatabaseHost = e.DatabaseSettings.Host;
+                DatabasePort = e.DatabaseSettings.Port;
+                DatabaseUsername = e.DatabaseSettings.Username;
+                DatabasePassword = e.DatabaseSettings.Password;
+                DatabaseName = e.DatabaseSettings.Database;
+                DatabaseSchema = e.DatabaseSettings.Schema;
+                DatabaseTable = e.DatabaseSettings.Table;
+                ConnectionTimeout = e.DatabaseSettings.ConnectionTimeout;
+                
+                LogDirectory = e.LogSettings.BaseDirectory;
+                LogFilePattern = e.LogSettings.LogFilePattern;
+                PollingInterval = e.LogSettings.PollingIntervalSeconds;
+                
+                OnPropertyChanged(nameof(HasUnsavedChanges));
+            }
+            finally
+            {
+                // Always reset the loading flag
+                _isLoadingConfiguration = false;
+            }
         }
 
         private void OnUnsavedChangesChanged(object? sender, EventArgs e)
