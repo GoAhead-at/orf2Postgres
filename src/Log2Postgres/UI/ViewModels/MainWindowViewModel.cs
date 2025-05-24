@@ -1,13 +1,4 @@
-using Microsoft.Extensions.Logging;
-using System;
-using System.Collections.ObjectModel;
-using System.ComponentModel;
-using System.Runtime.CompilerServices;
-using System.ServiceProcess;
-using System.Threading.Tasks;
-using System.Windows.Input;
-using Log2Postgres.Core.Services;
-using Log2Postgres.UI.Services;
+using Microsoft.Extensions.Logging;using System;using System.Collections.ObjectModel;using System.ComponentModel;using System.Runtime.CompilerServices;using System.ServiceProcess;using System.Threading.Tasks;using System.Windows.Input;using Log2Postgres.Core.Services;using Log2Postgres.UI.Services;
 
 namespace Log2Postgres.UI.ViewModels
 {
@@ -258,6 +249,8 @@ namespace Log2Postgres.UI.ViewModels
         public ICommand ResetConfigurationCommand { get; private set; } = null!;
         public ICommand InstallServiceCommand { get; private set; } = null!;
         public ICommand UninstallServiceCommand { get; private set; } = null!;
+        public ICommand StartServiceCommand { get; private set; } = null!;
+        public ICommand StopServiceCommand { get; private set; } = null!;
         public ICommand StartProcessingCommand { get; private set; } = null!;
         public ICommand StopProcessingCommand { get; private set; } = null!;
         public ICommand ClearLogsCommand { get; private set; } = null!;
@@ -270,10 +263,12 @@ namespace Log2Postgres.UI.ViewModels
             VerifyTableCommand = new AsyncRelayCommand(VerifyTableAsync);
             SaveConfigurationCommand = new AsyncRelayCommand(SaveConfigurationAsync);
             ResetConfigurationCommand = new AsyncRelayCommand(ResetConfigurationAsync);
-            InstallServiceCommand = new AsyncRelayCommand(InstallServiceAsync);
-            UninstallServiceCommand = new AsyncRelayCommand(UninstallServiceAsync);
-            StartProcessingCommand = new AsyncRelayCommand(StartProcessingAsync);
-            StopProcessingCommand = new AsyncRelayCommand(StopProcessingAsync);
+            InstallServiceCommand = new AsyncRelayCommand(InstallServiceAsync, () => !IsServiceInstalled);
+            UninstallServiceCommand = new AsyncRelayCommand(UninstallServiceAsync, () => IsServiceInstalled);
+            StartServiceCommand = new AsyncRelayCommand(StartServiceAsync, CanStartService);
+            StopServiceCommand = new AsyncRelayCommand(StopServiceAsync, CanStopService);
+            StartProcessingCommand = new AsyncRelayCommand(StartProcessingAsync, CanStartLocalProcessing);
+            StopProcessingCommand = new AsyncRelayCommand(StopProcessingAsync, CanStopLocalProcessing);
             ClearLogsCommand = new RelayCommand(ClearLogs);
         }
 
@@ -305,7 +300,37 @@ namespace Log2Postgres.UI.ViewModels
             
             await _configurationManager.LoadSettingsAsync();
             await _serviceManager.RefreshServiceStatusAsync();
+            UpdateServiceOperationalState(); // Update status display after checking service
             await UpdateDatabaseConnectionStatusAsync();
+            
+            // Try to connect to IPC if service is running
+            await TryConnectToIpcAsync();
+        }
+
+        private async Task TryConnectToIpcAsync()
+        {
+            if (_ipcService == null)
+                return;
+                
+            // Only try to connect if service is installed and running
+            if (IsServiceInstalled && ServiceStatus == ServiceControllerStatus.Running)
+            {
+                try
+                {
+                    _logger.LogInformation("Attempting to connect to service via IPC...");
+                    await _ipcService.ConnectAsync();
+                    _logger.LogInformation("Successfully connected to service via IPC");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to connect to service via IPC");
+                    AddLogEntry("⚠ Could not connect to service for real-time updates");
+                }
+            }
+            else
+            {
+                _logger.LogDebug("Service is not running, skipping IPC connection attempt");
+            }
         }
 
         #region Command Implementations
@@ -370,7 +395,24 @@ namespace Log2Postgres.UI.ViewModels
         {
             try
             {
-                                var dbSettings = new Core.Services.DatabaseSettings                {                    Host = DatabaseHost,                    Port = DatabasePort,                    Username = DatabaseUsername,                    Password = DatabasePassword,                    Database = DatabaseName,                    Schema = DatabaseSchema,                    Table = DatabaseTable,                    ConnectionTimeout = ConnectionTimeout                };                var logSettings = new Core.Services.LogMonitorSettings                {                    BaseDirectory = LogDirectory,                    LogFilePattern = LogFilePattern,                    PollingIntervalSeconds = PollingInterval                };
+                var dbSettings = new Core.Services.DatabaseSettings
+                {
+                    Host = DatabaseHost,
+                    Port = DatabasePort,
+                    Username = DatabaseUsername,
+                    Password = DatabasePassword,
+                    Database = DatabaseName,
+                    Schema = DatabaseSchema,
+                    Table = DatabaseTable,
+                    ConnectionTimeout = ConnectionTimeout
+                };
+                
+                var logSettings = new Core.Services.LogMonitorSettings
+                {
+                    BaseDirectory = LogDirectory,
+                    LogFilePattern = LogFilePattern,
+                    PollingIntervalSeconds = PollingInterval
+                };
 
                 await _configurationManager.SaveSettingsAsync(dbSettings, logSettings);
                 AddLogEntry("✓ Configuration saved successfully");
@@ -402,6 +444,9 @@ namespace Log2Postgres.UI.ViewModels
             {
                 await _serviceManager.InstallServiceAsync();
                 AddLogEntry("✓ Service installation initiated");
+                
+                // Refresh service status to update UI state
+                await _serviceManager.RefreshServiceStatusAsync();
             }
             catch (Exception ex)
             {
@@ -416,6 +461,9 @@ namespace Log2Postgres.UI.ViewModels
             {
                 await _serviceManager.UninstallServiceAsync();
                 AddLogEntry("✓ Service uninstallation initiated");
+                
+                // Refresh service status to update UI state
+                await _serviceManager.RefreshServiceStatusAsync();
             }
             catch (Exception ex)
             {
@@ -424,21 +472,48 @@ namespace Log2Postgres.UI.ViewModels
             }
         }
 
+        private async Task StartServiceAsync()
+        {
+            try
+            {
+                await _serviceManager.StartServiceAsync();
+                AddLogEntry("✓ Service start initiated");
+                
+                // Refresh service status to update UI state
+                await _serviceManager.RefreshServiceStatusAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error starting service");
+                AddLogEntry($"✗ Start service error: {ex.Message}");
+            }
+        }
+
+        private async Task StopServiceAsync()
+        {
+            try
+            {
+                await _serviceManager.StopServiceAsync();
+                AddLogEntry("✓ Service stop initiated");
+                
+                // Refresh service status to update UI state
+                await _serviceManager.RefreshServiceStatusAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error stopping service");
+                AddLogEntry($"✗ Stop service error: {ex.Message}");
+            }
+        }
+
         private async Task StartProcessingAsync()
         {
             try
             {
-                if (IsServiceInstalled)
-                {
-                    await _serviceManager.StartServiceAsync();
-                    AddLogEntry("✓ Service start initiated");
-                }
-                else
-                {
-                    await _logFileWatcher.UIManagedStartProcessingAsync();
-                    IsProcessing = true;
-                    AddLogEntry("✓ Local processing started");
-                }
+                // Only start local processing - service has its own Start/Stop commands
+                await _logFileWatcher.UIManagedStartProcessingAsync();
+                IsProcessing = true;
+                AddLogEntry("✓ Local processing started");
             }
             catch (Exception ex)
             {
@@ -451,17 +526,10 @@ namespace Log2Postgres.UI.ViewModels
         {
             try
             {
-                if (IsServiceInstalled)
-                {
-                    await _serviceManager.StopServiceAsync();
-                    AddLogEntry("✓ Service stop initiated");
-                }
-                else
-                {
-                    _logFileWatcher.UIManagedStopProcessing();
-                    IsProcessing = false;
-                    AddLogEntry("✓ Local processing stopped");
-                }
+                // Only stop local processing - service has its own Start/Stop commands
+                _logFileWatcher.UIManagedStopProcessing();
+                IsProcessing = false;
+                AddLogEntry("✓ Local processing stopped");
             }
             catch (Exception ex)
             {
@@ -472,20 +540,127 @@ namespace Log2Postgres.UI.ViewModels
 
         private void ClearLogs()
         {
-            LogEntries.Clear();
+            // Ensure UI updates happen on the UI thread
+            if (System.Windows.Application.Current?.Dispatcher.CheckAccess() == true)
+            {
+                LogEntries.Clear();
+            }
+            else
+            {
+                System.Windows.Application.Current?.Dispatcher.BeginInvoke(() => LogEntries.Clear());
+            }
             _logger.LogInformation("UI logs cleared");
         }
+
+        #region CanExecute Methods
+
+        private bool CanStartService()
+        {
+            return IsServiceInstalled && 
+                   (ServiceStatus == ServiceControllerStatus.Stopped || 
+                    ServiceStatus == ServiceControllerStatus.StopPending);
+        }
+
+        private bool CanStopService()
+        {
+            return IsServiceInstalled && 
+                   (ServiceStatus == ServiceControllerStatus.Running || 
+                    ServiceStatus == ServiceControllerStatus.StartPending);
+        }
+
+        private bool CanStartLocalProcessing()
+        {
+            // Can start local processing if:
+            // 1. Not currently processing locally
+            // 2. Service is not installed or not running (to avoid conflicts)
+            return !IsProcessing && 
+                   (!IsServiceInstalled || 
+                    ServiceStatus == ServiceControllerStatus.Stopped ||
+                    !IsIpcConnected);
+        }
+
+        private bool CanStopLocalProcessing()
+        {
+            // Can stop local processing if currently processing locally
+            return IsProcessing;
+        }
+
+        #endregion
 
         #endregion
 
         #region Event Handlers
 
+        private void UpdateServiceOperationalState()
+        {
+            if (!IsServiceInstalled)
+            {
+                ServiceOperationalState = "Local Mode";
+            }
+            else if (IsIpcConnected && ServiceStatus == ServiceControllerStatus.Running)
+            {
+                // IPC will provide detailed status - keep current value
+                // ServiceOperationalState is updated via OnServiceStatusReceived
+            }
+            else
+            {
+                ServiceOperationalState = ServiceStatus switch
+                {
+                    ServiceControllerStatus.Running => IsIpcConnected ? "Service Running" : "Service Running (Connecting...)",
+                    ServiceControllerStatus.Stopped => "Service Stopped",
+                    ServiceControllerStatus.StartPending => "Service Starting...",
+                    ServiceControllerStatus.StopPending => "Service Stopping...",
+                    ServiceControllerStatus.Paused => "Service Paused",
+                    ServiceControllerStatus.PausePending => "Service Pausing...",
+                    ServiceControllerStatus.ContinuePending => "Service Resuming...",
+                    _ => $"Service Status: {ServiceStatus}"
+                };
+            }
+        }
+
         private void OnServiceStatusChanged(object? sender, ServiceStatusChangedEventArgs e)
+        {
+            // Ensure UI property updates happen on the UI thread
+            if (System.Windows.Application.Current?.Dispatcher.CheckAccess() == true)
+            {
+                UpdateServiceStatusProperties(e);
+            }
+            else
+            {
+                System.Windows.Application.Current?.Dispatcher.BeginInvoke(() => UpdateServiceStatusProperties(e));
+            }
+        }
+        
+        private void UpdateServiceStatusProperties(ServiceStatusChangedEventArgs e)
         {
             IsServiceInstalled = e.IsInstalled;
             ServiceStatus = e.Status;
+            
+            // Update ServiceOperationalState based on service installation and status
+            UpdateServiceOperationalState();
+            
             _logger.LogDebug("Service status changed: Installed={IsInstalled}, Status={Status}", 
                 e.IsInstalled, e.Status);
+            
+            // Try to connect to IPC when service starts running
+            if (e.IsInstalled && e.Status == ServiceControllerStatus.Running)
+            {
+                _ = Task.Run(async () => await TryConnectToIpcAsync());
+            }
+            // Disconnect IPC when service stops
+            else if (!e.IsInstalled || e.Status == ServiceControllerStatus.Stopped)
+            {
+                _ = Task.Run(async () => 
+                {
+                    if (_ipcService != null && _ipcService.IsConnected)
+                    {
+                        await _ipcService.DisconnectAsync();
+                    }
+                });
+            }
+            
+            // Trigger command CanExecute refresh
+            CommandManager.InvalidateRequerySuggested();
         }
 
         private void OnConfigurationChanged(object? sender, ConfigurationChangedEventArgs e)
@@ -535,33 +710,75 @@ namespace Log2Postgres.UI.ViewModels
 
         private Task OnIpcConnected()
         {
-            IsIpcConnected = true;
-            AddLogEntry("✓ IPC connection established");
+            // Ensure UI property updates happen on the UI thread
+            if (System.Windows.Application.Current?.Dispatcher.CheckAccess() == true)
+            {
+                IsIpcConnected = true;
+                UpdateServiceOperationalState();
+                AddLogEntry("✓ IPC connection established");
+            }
+            else
+            {
+                System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
+                {
+                    IsIpcConnected = true;
+                    UpdateServiceOperationalState();
+                    AddLogEntry("✓ IPC connection established");
+                });
+            }
             return Task.CompletedTask;
         }
 
         private Task OnIpcDisconnected()
         {
-            IsIpcConnected = false;
-            AddLogEntry("⚠ IPC connection lost");
+            // Ensure UI property updates happen on the UI thread
+            if (System.Windows.Application.Current?.Dispatcher.CheckAccess() == true)
+            {
+                IsIpcConnected = false;
+                UpdateServiceOperationalState();
+                AddLogEntry("⚠ IPC connection lost");
+            }
+            else
+            {
+                System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
+                {
+                    IsIpcConnected = false;
+                    UpdateServiceOperationalState();
+                    AddLogEntry("⚠ IPC connection lost");
+                });
+            }
             return Task.CompletedTask;
         }
 
         private Task OnServiceStatusReceived(PipeServiceStatus status)
+        {
+            // Ensure UI property updates happen on the UI thread
+            if (System.Windows.Application.Current?.Dispatcher.CheckAccess() == true)
+            {
+                UpdateServiceStatusFromIpc(status);
+            }
+            else
+            {
+                System.Windows.Application.Current?.Dispatcher.BeginInvoke(() => UpdateServiceStatusFromIpc(status));
+            }
+            return Task.CompletedTask;
+        }
+
+        private void UpdateServiceStatusFromIpc(PipeServiceStatus status)
         {
             ServiceOperationalState = status.ServiceOperationalState;
             CurrentFile = System.IO.Path.GetFileName(status.CurrentFile);
             CurrentPosition = status.CurrentPosition;
             TotalLinesProcessed = status.TotalLinesProcessedSinceStart; // long to long assignment
             IsProcessing = status.IsProcessing;
-            return Task.CompletedTask;
         }
 
         private Task OnLogEntriesReceived(System.Collections.Generic.List<string> logEntries)
         {
+            // AddLogEntry is already thread-safe, but let's be explicit about threading here
             foreach (var entry in logEntries)
             {
-                AddLogEntry(entry);
+                AddLogEntry(entry); // AddLogEntry handles thread safety internally
             }
             return Task.CompletedTask;
         }
@@ -573,12 +790,32 @@ namespace Log2Postgres.UI.ViewModels
             const int maxLogEntries = 500;
             
             var timestampedMessage = $"[{DateTime.Now:HH:mm:ss}] {message}";
-            LogEntries.Add(timestampedMessage);
             
-            // Keep log entries within limit
-            while (LogEntries.Count > maxLogEntries)
+            // Ensure UI updates happen on the UI thread
+            if (System.Windows.Application.Current?.Dispatcher.CheckAccess() == true)
             {
-                LogEntries.RemoveAt(0);
+                // We're on the UI thread, update directly
+                LogEntries.Add(timestampedMessage);
+                
+                // Keep log entries within limit
+                while (LogEntries.Count > maxLogEntries)
+                {
+                    LogEntries.RemoveAt(0);
+                }
+            }
+            else
+            {
+                // We're on a background thread, dispatch to UI thread
+                System.Windows.Application.Current?.Dispatcher.BeginInvoke(() =>
+                {
+                    LogEntries.Add(timestampedMessage);
+                    
+                    // Keep log entries within limit
+                    while (LogEntries.Count > maxLogEntries)
+                    {
+                        LogEntries.RemoveAt(0);
+                    }
+                });
             }
         }
 
