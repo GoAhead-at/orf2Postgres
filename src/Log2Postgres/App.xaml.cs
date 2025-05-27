@@ -160,18 +160,14 @@ namespace Log2Postgres
 
                 hostBuilder.UseSerilog((hostingContext, services, loggerConfiguration) => 
                 {
-                    loggerConfiguration
-                        .ReadFrom.Configuration(hostingContext.Configuration)
-                        .Enrich.FromLogContext();
+                    ConfigureSerilogWithErrorHandling(hostingContext, loggerConfiguration);
                 });
             }
             else
             {
                 hostBuilder.UseSerilog((hostingContext, services, loggerConfiguration) => 
                 {
-                    loggerConfiguration
-                        .ReadFrom.Configuration(hostingContext.Configuration)
-                        .Enrich.FromLogContext();
+                    ConfigureSerilogWithErrorHandling(hostingContext, loggerConfiguration);
                 });
             }
 
@@ -261,6 +257,42 @@ namespace Log2Postgres
             return hostBuilder;
         }
 
+        private static void ConfigureSerilogWithErrorHandling(Microsoft.Extensions.Hosting.HostBuilderContext hostingContext, Serilog.LoggerConfiguration loggerConfiguration)
+        {
+            try
+            {
+                // For single-file publishing compatibility, explicitly load Serilog assemblies
+                var assemblies = new[]
+                {
+                    System.Reflection.Assembly.Load("Serilog.Sinks.Console"),
+                    System.Reflection.Assembly.Load("Serilog.Sinks.File"),
+                    System.Reflection.Assembly.Load("Serilog.Enrichers.Thread"),
+                    System.Reflection.Assembly.Load("Serilog.Enrichers.Environment"),
+                    System.Reflection.Assembly.Load("Serilog.Enrichers.Process")
+                }.OfType<System.Reflection.Assembly>().ToArray();
+
+                var readerOptions = new Serilog.Settings.Configuration.ConfigurationReaderOptions(assemblies);
+                
+                loggerConfiguration
+                    .ReadFrom.Configuration(hostingContext.Configuration, readerOptions)
+                    .Enrich.FromLogContext();
+            }
+            catch (Exception ex)
+            {
+                // Fallback to basic console logging if configuration fails
+                Console.WriteLine($"[SERILOG_CONFIG_ERROR] Failed to configure Serilog from configuration: {ex.Message}");
+                Console.WriteLine("[SERILOG_CONFIG_ERROR] Falling back to basic console logging");
+                
+                loggerConfiguration
+                    .MinimumLevel.Debug()
+                    .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
+                    .Enrich.FromLogContext()
+                    .Enrich.WithThreadId()
+                    .Enrich.WithMachineName()
+                    .Enrich.WithProcessId();
+            }
+        }
+
         protected override async void OnStartup(StartupEventArgs e)
         {
             try
@@ -282,7 +314,16 @@ namespace Log2Postgres
 
                 if (_host == null)
                 {
-                    _host = CreateHostBuilder(e.Args).Build();
+                    try
+                    {
+                        _host = CreateHostBuilder(e.Args).Build();
+                    }
+                    catch (Exception hostBuildEx)
+                    {
+                        // Configuration loading failed - try to recover
+                        await HandleConfigurationError(hostBuildEx, e.Args);
+                        return;
+                    }
                 }
                 
                 await _host.StartAsync();
@@ -341,6 +382,105 @@ namespace Log2Postgres
                 {
                     Shutdown(-1);
                 }
+            }
+        }
+
+        private async Task HandleConfigurationError(Exception configException, string[] args)
+        {
+            try
+            {
+                Console.WriteLine($"[CONFIG_ERROR] Configuration loading failed: {configException.Message}");
+                
+                // Try to create a backup of the corrupted config and create a new default one
+                string configPath = Path.Combine(AppContext.BaseDirectory, "appsettings.json");
+                
+                if (File.Exists(configPath))
+                {
+                    string backupPath = Path.Combine(AppContext.BaseDirectory, $"appsettings.json.backup.{DateTime.Now:yyyyMMdd_HHmmss}");
+                    File.Copy(configPath, backupPath);
+                    Console.WriteLine($"[CONFIG_ERROR] Backed up corrupted config to: {backupPath}");
+                }
+
+                // Create default configuration with proper Serilog Using section
+                const string defaultConfig = @"{
+  ""Serilog"": {
+    ""Using"": [
+      ""Serilog.Sinks.Console"",
+      ""Serilog.Sinks.File"",
+      ""Serilog.Enrichers.Environment"",
+      ""Serilog.Enrichers.Process"",
+      ""Serilog.Enrichers.Thread""
+    ],
+    ""MinimumLevel"": {
+      ""Default"": ""Debug"",
+      ""Override"": {
+        ""Microsoft"": ""Information"",
+        ""System"": ""Information""
+      }
+    },
+    ""WriteTo"": [
+      {
+        ""Name"": ""Console"",
+        ""Args"": {
+          ""outputTemplate"": ""[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj} {Properties:j}{NewLine}{Exception}""
+        }
+      }
+    ],
+    ""Enrich"": [ ""FromLogContext"", ""WithThreadId"", ""WithMachineName"", ""WithProcessId"" ]
+  },
+  ""DatabaseSettings"": {
+    ""Host"": ""localhost"",
+    ""Port"": ""5432"",
+    ""Username"": ""orf"",
+    ""Password"": """",
+    ""Database"": ""orf"",
+    ""Schema"": ""orf"",
+    ""Table"": ""orf_logs"",
+    ""ConnectionTimeout"": 30
+  },
+  ""LogMonitorSettings"": {
+    ""BaseDirectory"": """",
+    ""LogFilePattern"": ""orfee-{Date:yyyy-MM-dd}.log"",
+    ""PollingIntervalSeconds"": 5
+  }
+}";
+
+                await File.WriteAllTextAsync(configPath, defaultConfig);
+                Console.WriteLine("[CONFIG_ERROR] Created new default configuration file");
+
+                // Try to build host again with the new configuration
+                _host = CreateHostBuilder(args).Build();
+                await _host.StartAsync();
+
+                // Show user-friendly message about the recovery
+                bool isServiceMode = IsRunningAsService();
+                if (!isServiceMode)
+                {
+                    System.Windows.MessageBox.Show(
+                        $"The configuration file was corrupted and has been reset to defaults.\n\n" +
+                        $"Original file backed up to: appsettings.json.backup.{DateTime.Now:yyyyMMdd_HHmmss}\n\n" +
+                        $"Please reconfigure your database and log directory settings.",
+                        "Configuration Recovered", 
+                        MessageBoxButton.OK, 
+                        MessageBoxImage.Warning);
+                }
+
+                Console.WriteLine("[CONFIG_ERROR] Successfully recovered from configuration error");
+            }
+            catch (Exception recoveryEx)
+            {
+                Console.WriteLine($"[CONFIG_ERROR] Failed to recover from configuration error: {recoveryEx.Message}");
+                
+                System.Windows.MessageBox.Show(
+                    $"Critical configuration error that could not be automatically recovered:\n\n" +
+                    $"Original error: {configException.Message}\n" +
+                    $"Recovery error: {recoveryEx.Message}\n\n" +
+                    $"Please check the appsettings.json file manually or delete it to reset to defaults.",
+                    "Critical Configuration Error", 
+                    MessageBoxButton.OK, 
+                    MessageBoxImage.Error);
+                
+                Shutdown(-1);
             }
         }
 

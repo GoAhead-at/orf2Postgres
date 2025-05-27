@@ -366,30 +366,80 @@ namespace Log2Postgres.UI.ViewModels
         {
             try
             {
-                _logger.LogInformation("Verifying database table");
+                _logger.LogInformation("Verifying/creating database table");
+                AddLogEntry("🔍 Checking database table...");
+                
                 var tableExists = await _postgresService.TableExistsAsync();
                 
                 if (tableExists)
                 {
+                    AddLogEntry("✓ Database table exists, validating structure...");
                     var isValid = await _postgresService.ValidateTableStructureAsync();
                     if (isValid)
                     {
                         AddLogEntry("✓ Database table exists and structure is valid");
+                        _logger.LogInformation("Database table validation successful");
                     }
                     else
                     {
                         AddLogEntry("⚠ Database table exists but structure is invalid");
+                        AddLogEntry("🔧 Attempting to recreate table with correct structure...");
+                        
+                        // Drop and recreate table with correct structure
+                        var dropResult = await _postgresService.DropTableAsync();
+                        if (dropResult)
+                        {
+                            AddLogEntry("✓ Old table dropped successfully");
+                            var createResult = await _postgresService.CreateTableAsync();
+                            if (createResult)
+                            {
+                                AddLogEntry("✓ Database table recreated with correct structure");
+                                _logger.LogInformation("Database table recreated successfully");
+                            }
+                            else
+                            {
+                                AddLogEntry("✗ Failed to recreate database table");
+                                _logger.LogError("Failed to recreate database table");
+                            }
+                        }
+                        else
+                        {
+                            AddLogEntry("✗ Failed to drop invalid table");
+                            _logger.LogError("Failed to drop invalid table");
+                        }
                     }
                 }
                 else
                 {
-                    AddLogEntry("✗ Database table does not exist");
+                    AddLogEntry("⚠ Database table does not exist, creating...");
+                    var createResult = await _postgresService.CreateTableAsync();
+                    if (createResult)
+                    {
+                        AddLogEntry("✓ Database table created successfully");
+                        _logger.LogInformation("Database table created successfully");
+                        
+                        // Verify the newly created table
+                        var isValid = await _postgresService.ValidateTableStructureAsync();
+                        if (isValid)
+                        {
+                            AddLogEntry("✓ New table structure validated successfully");
+                        }
+                        else
+                        {
+                            AddLogEntry("⚠ New table created but structure validation failed");
+                        }
+                    }
+                    else
+                    {
+                        AddLogEntry("✗ Failed to create database table");
+                        _logger.LogError("Failed to create database table");
+                    }
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error verifying database table");
-                AddLogEntry($"✗ Table verification error: {ex.Message}");
+                _logger.LogError(ex, "Error verifying/creating database table");
+                AddLogEntry($"✗ Table verification/creation error: {ex.Message}");
             }
         }
 

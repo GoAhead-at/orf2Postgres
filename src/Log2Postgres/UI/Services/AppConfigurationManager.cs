@@ -194,6 +194,13 @@ namespace Log2Postgres.UI.Services
         {
             const string defaultConfig = @"{
   ""Serilog"": {
+    ""Using"": [
+      ""Serilog.Sinks.Console"",
+      ""Serilog.Sinks.File"",
+      ""Serilog.Enrichers.Environment"",
+      ""Serilog.Enrichers.Process"",
+      ""Serilog.Enrichers.Thread""
+    ],
     ""MinimumLevel"": {
       ""Default"": ""Debug"",
       ""Override"": {

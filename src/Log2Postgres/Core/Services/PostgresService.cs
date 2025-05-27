@@ -178,7 +178,7 @@ namespace Log2Postgres.Core.Services
             using var connection = new NpgsqlConnection(connectionString);
             await connection.OpenAsync();
             
-            string sql = $"CREATE SCHEMA IF NOT EXISTS {currentSettings.Schema};"; // Use currentSettings
+            string sql = $"CREATE SCHEMA IF NOT EXISTS \"{currentSettings.Schema}\";"; // Use currentSettings
             
             using var cmd = new NpgsqlCommand(sql, connection);
             await cmd.ExecuteNonQueryAsync();
@@ -201,7 +201,7 @@ namespace Log2Postgres.Core.Services
                 await connection.OpenAsync();
                 
                 string sql = $@"
-                    CREATE TABLE {currentSettings.Schema}.{currentSettings.Table} (
+                    CREATE TABLE ""{currentSettings.Schema}"".""{currentSettings.Table}"" (
                       message_id TEXT PRIMARY KEY,
                       event_source TEXT,
                       event_datetime TIMESTAMPTZ,
@@ -394,7 +394,7 @@ namespace Log2Postgres.Core.Services
                 using var connection = new NpgsqlConnection(connectionString);
                 await connection.OpenAsync();
                 
-                string sql = $"DROP TABLE IF EXISTS {currentSettings.Schema}.{currentSettings.Table};";
+                string sql = $"DROP TABLE IF EXISTS \"{currentSettings.Schema}\".\"{currentSettings.Table}\";";
                 
                 using var cmd = new NpgsqlCommand(sql, connection);
                 await cmd.ExecuteNonQueryAsync();
@@ -432,7 +432,7 @@ namespace Log2Postgres.Core.Services
                     try
                     {
                         await using var cmd = new NpgsqlCommand($@"
-                        INSERT INTO {currentSettings.Schema}.{currentSettings.Table} 
+                        INSERT INTO ""{currentSettings.Schema}"".""{currentSettings.Table}"" 
                         (message_id, event_source, event_datetime, event_class, 
                         event_severity, event_action, filtering_point, ip, 
                         sender, recipients, msg_subject, msg_author, 
@@ -502,7 +502,7 @@ namespace Log2Postgres.Core.Services
                 await using var connection = new NpgsqlConnection(connectionString);
                 await connection.OpenAsync();
                 
-                await using var cmd = new NpgsqlCommand($"SELECT COUNT(*) FROM {currentSettings.Schema}.{currentSettings.Table}", connection);
+                await using var cmd = new NpgsqlCommand($"SELECT COUNT(*) FROM \"{currentSettings.Schema}\".\"{currentSettings.Table}\"", connection);
                 object? result = await cmd.ExecuteScalarAsync();
                 return result is DBNull ? 0 : Convert.ToInt64(result);
             }
@@ -533,7 +533,7 @@ namespace Log2Postgres.Core.Services
                         event_action, filtering_point, ip, sender, recipients, 
                         msg_subject, msg_author, remote_peer, source_ip, country, 
                         event_msg, filename, processed_at
-                    FROM {currentSettings.Schema}.{currentSettings.Table}
+                    FROM ""{currentSettings.Schema}"".""{currentSettings.Table}""
                     ORDER BY event_datetime DESC
                     LIMIT @limit;";
                 
